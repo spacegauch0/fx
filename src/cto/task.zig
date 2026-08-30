@@ -3,6 +3,11 @@ pub const TaskStatus = enum {
     delegated,
     working,
     approval_required,
+    /// A human approved the candidate but materializing or health-checking
+    /// the release failed. The approval stands and is retryable with
+    /// `fx cto activate <id>`; the capability is deliberately left as a
+    /// candidate, because it is not actually live.
+    activation_failed,
     completed,
     rejected,
     failed,

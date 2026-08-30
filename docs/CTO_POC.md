@@ -228,11 +228,14 @@ no-op today (worker cancellation isn't implemented).
   a live worker run, so `github_events.zig` is a reviewed, hand-written
   reference implementation of the target shape — not evidence that the
   live loop reliably generates working connectors end to end.
-- **Activation is registry-only.** Approving a task flips
-  `.cto/capabilities.json`; it does not merge the candidate branch, restart
-  the running binary, or otherwise make the new code live. That "atomic
-  version switch + restart + rollback if unhealthy" step described in the
-  original design notes is intentionally out of scope for this PoC.
+- **Activation switches a validated pointer, not the running binary.**
+  `fx cto approve` commits the candidate's boundary-allowed work to its
+  own branch, materializes a detached release worktree under
+  `.cto/releases/v<n>/`, runs `zig build` + `zig build test` there, and
+  only then atomically repoints `.cto/current` at it. `fx cto rollback`
+  reverses that. What it does *not* do is replace the running `fx`
+  process — an operator builds or installs from `.cto/current`.
+  Hot-swapping a live binary remains out of scope.
 - **No cleanup command.** Worktrees and candidate branches accumulate under
   `.cto/worktrees/` and as local `candidate/task-N` branches. A
   `fx cto tasks --gc` or similar is a natural follow-up, not included here

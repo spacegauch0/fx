@@ -10,6 +10,9 @@ const policy = @import("policy.zig");
 const goal_mod = @import("goal.zig");
 const run_mod = @import("run.zig");
 const observation_mod = @import("observation.zig");
+const release_mod = @import("release.zig");
+const candidate_mod = @import("candidate.zig");
+const git = @import("git.zig");
 
 /// The trusted CTO kernel: task lifecycle, capability registry, event
 /// journal, and the approval boundary. Everything here is meant to stay
@@ -24,9 +27,11 @@ pub const Kernel = struct {
     goals: std.ArrayList(goal_mod.Goal),
     runs: std.ArrayList(run_mod.Run),
     observations: std.ArrayList(observation_mod.Observation),
+    releases: std.ArrayList(release_mod.Release),
     next_task_id: u64 = 1,
     next_goal_id: u64 = 1,
     next_run_id: u64 = 1,
+    next_release_version: u64 = 1,
 
     /// `cto_root` may be relative (the default is ".cto"); it is resolved
     /// to an absolute path once, up front, since every durable write below
@@ -59,6 +64,9 @@ pub const Kernel = struct {
         var observations: std.ArrayList(observation_mod.Observation) = .empty;
         errdefer observations.deinit(allocator);
         try observations.appendSlice(allocator, try store.loadObservations(allocator, cto_root));
+        var releases: std.ArrayList(release_mod.Release) = .empty;
+        errdefer releases.deinit(allocator);
+        try releases.appendSlice(allocator, try store.loadReleases(allocator, cto_root));
 
         var next_task_id: u64 = 1;
         for (tasks.items) |task| {
@@ -72,6 +80,10 @@ pub const Kernel = struct {
         for (runs.items) |run| {
             if (run.id >= next_run_id) next_run_id = run.id + 1;
         }
+        var next_release_version: u64 = 1;
+        for (releases.items) |release| {
+            if (release.version >= next_release_version) next_release_version = release.version + 1;
+        }
 
         return .{
             .allocator = allocator,
@@ -82,6 +94,8 @@ pub const Kernel = struct {
             .goals = goals,
             .runs = runs,
             .observations = observations,
+            .releases = releases,
+            .next_release_version = next_release_version,
             .next_task_id = next_task_id,
             .next_goal_id = next_goal_id,
             .next_run_id = next_run_id,
@@ -93,6 +107,7 @@ pub const Kernel = struct {
         self.goals.deinit(self.allocator);
         self.runs.deinit(self.allocator);
         self.observations.deinit(self.allocator);
+        self.releases.deinit(self.allocator);
         self.journal.deinit();
         self.capabilities.deinit();
     }
@@ -261,34 +276,151 @@ pub const Kernel = struct {
         });
     }
 
-    pub fn approve(self: *Kernel, task_id: u64) !void {
+    pub const ActivationOutcome = union(enum) {
+        /// The release is built, tested, and `.cto/current` points at it.
+        activated: release_mod.Release,
+        /// The human approval stands, but the release did not become live.
+        /// The capability remains a candidate because it is not actually
+        /// available, and `activate` can be retried.
+        health_failed: []const u8,
+    };
+
+    /// Records a human approval, then materializes and activates the
+    /// candidate.
+    ///
+    /// Approval and activation are one command because a capability that
+    /// is not live is not available: flipping the registry without a
+    /// working release would make `fx cto capabilities` lie. They remain
+    /// separable underneath, so a failed activation can be retried without
+    /// re-approving.
+    pub fn approve(self: *Kernel, repository_path: []const u8, task_id: u64) !ActivationOutcome {
         const task = self.findTask(task_id) orelse return error.TaskNotFound;
         if (task.status != .approval_required) return error.ApprovalNotRequired;
-
         const candidate_ref = task.candidate_ref orelse return error.CandidateMissing;
 
         _ = try self.journal.append(.approval_granted, task.required_capability, candidate_ref);
+        try self.persistTasks();
+        return self.activate(repository_path, task_id);
+    }
+
+    /// Materializes an approved candidate as a versioned release,
+    /// health-checks it, and only then moves the active pointer.
+    ///
+    /// Retryable: safe to call again after a `health_failed` outcome.
+    pub fn activate(self: *Kernel, repository_path: []const u8, task_id: u64) !ActivationOutcome {
+        const task = self.findTask(task_id) orelse return error.TaskNotFound;
+        switch (task.status) {
+            .approval_required, .activation_failed => {},
+            else => return error.ApprovalNotRequired,
+        }
+        const candidate_ref = task.candidate_ref orelse return error.CandidateMissing;
+        const worktree_path = task.worktree_path orelse return error.CandidateMissing;
+
+        // Commit the candidate's boundary-allowed work to its own branch so
+        // the release is pinned to an immutable commit. Only the CTO-created
+        // candidate branch is ever written to; human history is untouched.
+        const message = try std.fmt.allocPrint(
+            self.allocator,
+            "cto: candidate for {s} (task {d})",
+            .{ task.required_capability, task.id },
+        );
+        defer self.allocator.free(message);
+        const commit = git.commitCandidate(self.allocator, worktree_path, message) catch |err| {
+            return self.recordActivationFailure(task, @errorName(err));
+        };
+        defer self.allocator.free(commit);
+
+        const version = self.next_release_version;
+        const release_path = try release_mod.releasePath(self.allocator, self.cto_root, version);
+        errdefer self.allocator.free(release_path);
+
+        git.addWorktreeDetached(self.allocator, repository_path, release_path, commit) catch |err| {
+            const outcome = try self.recordActivationFailure(task, @errorName(err));
+            self.allocator.free(release_path);
+            return outcome;
+        };
+        _ = try self.journal.append(.release_materialized, task.required_capability, release_path);
+
+        const health = candidate_mod.healthCheck(self.allocator, release_path) catch |err| {
+            const outcome = try self.recordActivationFailure(task, @errorName(err));
+            self.allocator.free(release_path);
+            return outcome;
+        };
+        defer self.allocator.free(health.log);
+
+        if (!health.healthy()) {
+            const reason = try std.fmt.allocPrint(
+                self.allocator,
+                "release health check failed (build_ok={} test_ok={})",
+                .{ health.build_ok, health.test_ok },
+            );
+            defer self.allocator.free(reason);
+            const outcome = try self.recordActivationFailure(task, reason);
+            self.allocator.free(release_path);
+            return outcome;
+        }
+
+        // Everything below this line is the point of no return, and it is a
+        // single atomic rename.
+        try release_mod.pointCurrentAt(self.cto_root, release_path);
+
+        const release = release_mod.Release{
+            .version = version,
+            .task_id = task.id,
+            .capability = try self.allocator.dupe(u8, task.required_capability),
+            .branch = try self.allocator.dupe(u8, candidate_ref),
+            .commit = try self.allocator.dupe(u8, commit),
+            .path = release_path,
+            .build_ok = health.build_ok,
+            .test_ok = health.test_ok,
+            .activated_at_ms = io_mod.milliTimestamp(),
+        };
+        try self.releases.append(self.allocator, release);
+        self.next_release_version = version + 1;
 
         try self.capabilities.activate(task.required_capability, candidate_ref);
-
         task.status = .completed;
 
+        _ = try self.journal.append(.release_activated, task.required_capability, release_path);
         _ = try self.journal.append(.capability_activated, task.required_capability, candidate_ref);
 
+        try store.saveReleases(self.allocator, self.cto_root, self.releases.items);
         try self.persistCapabilities();
         try self.persistTasks();
         try store.saveVersionRecord(self.allocator, self.cto_root, .{
             .task_id = task.id,
             .capability = task.required_capability,
             .candidate_ref = candidate_ref,
-            .worktree_path = task.worktree_path orelse "",
-            .build_ok = task.build_ok,
-            .test_ok = task.test_ok,
+            .worktree_path = worktree_path,
+            .build_ok = health.build_ok,
+            .test_ok = health.test_ok,
             .summary = "candidate approved and activated",
             .created_at_ms = io_mod.milliTimestamp(),
             .approved = true,
             .approved_at_ms = io_mod.milliTimestamp(),
         });
+        return .{ .activated = release };
+    }
+
+    fn recordActivationFailure(self: *Kernel, task: *task_mod.Task, reason: []const u8) !ActivationOutcome {
+        task.status = .activation_failed;
+        _ = try self.journal.append(.release_health_failed, task.required_capability, reason);
+        try self.persistTasks();
+        return .{ .health_failed = reason };
+    }
+
+    /// Points the active release back at the previous known-good version.
+    /// The superseded release is left on disk so the move is reversible in
+    /// both directions.
+    pub fn rollback(self: *Kernel) !release_mod.Release {
+        const current = try release_mod.activeRelease(self.allocator, self.cto_root, self.releases.items) orelse
+            return error.NoActiveRelease;
+        const previous = release_mod.previousRelease(self.releases.items, current.version) orelse
+            return error.NoPreviousRelease;
+
+        try release_mod.pointCurrentAt(self.cto_root, previous.path);
+        _ = try self.journal.append(.release_rolled_back, previous.capability, previous.path);
+        return previous;
     }
 
     pub fn findTask(self: *Kernel, task_id: u64) ?*task_mod.Task {
@@ -336,16 +468,71 @@ test "approve requires a candidate to be ready first" {
     var kernel = try Kernel.init(alloc, cto_root);
     const task_id = try kernel.createCapabilityTask("watch merged pull requests", "github.pull_request.merged");
 
-    try std.testing.expectError(error.ApprovalNotRequired, kernel.approve(task_id));
+    try std.testing.expectError(error.ApprovalNotRequired, kernel.approve(root, task_id));
 
     try kernel.markDelegated(task_id);
     try kernel.markCandidate(task_id, "candidate/task-1", "/tmp/worktree", true, true);
     try std.testing.expect(!kernel.capabilities.isAvailable("github.pull_request.merged"));
     try std.testing.expectEqual(capability_mod.Status.candidate, kernel.capabilities.status("github.pull_request.merged"));
 
-    try kernel.approve(task_id);
-    try std.testing.expect(kernel.capabilities.isAvailable("github.pull_request.merged"));
-    try std.testing.expectEqual(task_mod.TaskStatus.completed, kernel.findTask(task_id).?.status);
+    // `/tmp/worktree` is not a git worktree, so materialization fails. The
+    // approval still stands, the task becomes retryable, and — the part
+    // that matters — the capability is NOT reported available, because it
+    // is not live.
+    const outcome = try kernel.approve(root, task_id);
+    try std.testing.expect(outcome == .health_failed);
+    try std.testing.expectEqual(task_mod.TaskStatus.activation_failed, kernel.findTask(task_id).?.status);
+    try std.testing.expect(!kernel.capabilities.isAvailable("github.pull_request.merged"));
+    try std.testing.expectEqual(
+        capability_mod.Status.candidate,
+        kernel.capabilities.status("github.pull_request.merged"),
+    );
+}
+
+test "rollback refuses when there is no active release" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const cto_root = try std.fs.path.join(alloc, &.{ root, ".cto" });
+
+    var kernel = try Kernel.init(alloc, cto_root);
+    try std.testing.expectError(error.NoActiveRelease, kernel.rollback());
+}
+
+test "releases survive process-like re-initialization and keep numbering" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const cto_root = try std.fs.path.join(alloc, &.{ root, ".cto" });
+
+    {
+        var kernel = try Kernel.init(alloc, cto_root);
+        try kernel.releases.append(alloc, .{
+            .version = 4,
+            .task_id = 1,
+            .capability = "github.pull_request.merged",
+            .branch = "candidate/task-1",
+            .commit = "abc123",
+            .path = "/repo/.cto/releases/v4",
+            .build_ok = true,
+            .test_ok = true,
+            .activated_at_ms = 99,
+        });
+        try store.saveReleases(alloc, cto_root, kernel.releases.items);
+    }
+
+    const reloaded = try Kernel.init(alloc, cto_root);
+    try std.testing.expectEqual(@as(usize, 1), reloaded.releases.items.len);
+    try std.testing.expectEqual(@as(u64, 4), reloaded.releases.items[0].version);
+    try std.testing.expectEqualStrings("abc123", reloaded.releases.items[0].commit);
+    // The next release must not reuse a version number.
+    try std.testing.expectEqual(@as(u64, 5), reloaded.next_release_version);
 }
 
 fn testObservation(alloc: std.mem.Allocator, delivery_id: []const u8) !observation_mod.Observation {

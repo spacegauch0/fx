@@ -14,22 +14,57 @@ pub const ValidationResult = struct {
     log: []const u8,
 };
 
+/// Build and test outcome with no boundary component. A materialized
+/// release is already-approved, already-committed code, so re-running the
+/// working-tree boundary check against it would be meaningless (it is
+/// clean by construction) — the question there is only whether it builds
+/// and passes.
+pub const HealthResult = struct {
+    build_ok: bool,
+    test_ok: bool,
+    log: []const u8,
+
+    pub fn healthy(self: HealthResult) bool {
+        return self.build_ok and self.test_ok;
+    }
+};
+
 pub fn validate(alloc: std.mem.Allocator, worktree_path: []const u8) !ValidationResult {
     var log: std.ArrayList(u8) = .empty;
     errdefer log.deinit(alloc);
 
     const boundary_ok = try validateExtensionBoundary(alloc, worktree_path, &log);
-    const build_ok = if (boundary_ok)
-        try runStep(alloc, worktree_path, &.{ "zig", "build" }, "zig build", &log)
-    else
-        false;
+    var build_ok = false;
+    var test_ok = false;
+    if (boundary_ok) {
+        build_ok = try runStep(alloc, worktree_path, &.{ "zig", "build" }, "zig build", &log);
+        if (build_ok) {
+            test_ok = try runStep(alloc, worktree_path, &.{ "zig", "build", "test" }, "zig build test", &log);
+        }
+    }
+
+    return .{
+        .boundary_ok = boundary_ok,
+        .build_ok = build_ok,
+        .test_ok = test_ok,
+        .log = try log.toOwnedSlice(alloc),
+    };
+}
+
+/// Runs the release health check inside a materialized release worktree.
+/// Called before the active pointer moves, so a release that cannot build
+/// never becomes current.
+pub fn healthCheck(alloc: std.mem.Allocator, release_path: []const u8) !HealthResult {
+    var log: std.ArrayList(u8) = .empty;
+    errdefer log.deinit(alloc);
+
+    const build_ok = try runStep(alloc, release_path, &.{ "zig", "build" }, "zig build", &log);
     const test_ok = if (build_ok)
-        try runStep(alloc, worktree_path, &.{ "zig", "build", "test" }, "zig build test", &log)
+        try runStep(alloc, release_path, &.{ "zig", "build", "test" }, "zig build test", &log)
     else
         false;
 
     return .{
-        .boundary_ok = boundary_ok,
         .build_ok = build_ok,
         .test_ok = test_ok,
         .log = try log.toOwnedSlice(alloc),

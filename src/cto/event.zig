@@ -24,6 +24,10 @@ pub const EventKind = enum {
     observation_recorded,
     observation_duplicate,
     ingest_rejected,
+    release_materialized,
+    release_health_failed,
+    release_activated,
+    release_rolled_back,
 };
 
 pub const Event = struct {

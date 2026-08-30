@@ -12,7 +12,9 @@ const event_mod = @import("event.zig");
 const goal_mod = @import("goal.zig");
 const run_mod = @import("run.zig");
 const observation_mod = @import("observation.zig");
+const release_mod = @import("release.zig");
 
+pub const releases_file_name = "releases.json";
 pub const events_file_name = "events.jsonl";
 pub const observations_file_name = "observations.jsonl";
 pub const capabilities_file_name = "capabilities.json";
@@ -142,6 +144,54 @@ pub fn saveRuns(alloc: std.mem.Allocator, cto_root_abs: []const u8, runs: []cons
     const path = try pathIn(alloc, cto_root_abs, runs_file_name);
     defer alloc.free(path);
     const bytes = try std.json.Stringify.valueAlloc(alloc, runs, .{ .whitespace = .indent_2 });
+    defer alloc.free(bytes);
+    try io_mod.writeFileAtomic(alloc, path, bytes);
+}
+
+// -- releases.json -------------------------------------------------------
+
+pub fn loadReleases(alloc: std.mem.Allocator, cto_root_abs: []const u8) ![]release_mod.Release {
+    const path = try pathIn(alloc, cto_root_abs, releases_file_name);
+    defer alloc.free(path);
+    const bytes = try readFileIfExists(alloc, path) orelse return &.{};
+    defer alloc.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const items = switch (parsed.value) {
+        .array => |value| value.items,
+        else => return &.{},
+    };
+    var releases: std.ArrayList(release_mod.Release) = .empty;
+    errdefer releases.deinit(alloc);
+    for (items) |item| {
+        const obj = switch (item) {
+            .object => |value| value,
+            else => continue,
+        };
+        const version = jsonInt(obj, "version") orelse continue;
+        try releases.append(alloc, .{
+            .version = @intCast(version),
+            .task_id = @intCast(jsonInt(obj, "task_id") orelse 0),
+            .capability = try alloc.dupe(u8, jsonString(obj, "capability") orelse ""),
+            .branch = try alloc.dupe(u8, jsonString(obj, "branch") orelse ""),
+            .commit = try alloc.dupe(u8, jsonString(obj, "commit") orelse ""),
+            .path = try alloc.dupe(u8, jsonString(obj, "path") orelse ""),
+            .build_ok = jsonBool(obj, "build_ok") orelse false,
+            .test_ok = jsonBool(obj, "test_ok") orelse false,
+            .activated_at_ms = jsonInt(obj, "activated_at_ms") orelse 0,
+        });
+    }
+    return releases.toOwnedSlice(alloc);
+}
+
+pub fn saveReleases(
+    alloc: std.mem.Allocator,
+    cto_root_abs: []const u8,
+    releases: []const release_mod.Release,
+) !void {
+    const path = try pathIn(alloc, cto_root_abs, releases_file_name);
+    defer alloc.free(path);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, releases, .{ .whitespace = .indent_2 });
     defer alloc.free(bytes);
     try io_mod.writeFileAtomic(alloc, path, bytes);
 }

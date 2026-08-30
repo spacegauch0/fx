@@ -17,11 +17,11 @@ current shape is wrong, the plan changes it rather than working around it.
 | GitHub connector (`pull_request` merged, normalized + provenance) | Done |
 | Human control surface (CLI + `channel` parser) | Done |
 | 1. Durable observations, delivery dedup, merge timestamps | Done |
-| 1. Project memory (facts, decisions, outcomes) | M3 |
+| 1. Project memory (facts, decisions, outcomes) | Outstanding |
 | 2. GitHub ingestion service — signature verification | Done (M2) |
 | 2. GitHub ingestion service — listener / polling | M5 |
 | 3. Planning and supervision | M4 |
-| 4. Version activation and rollback | M3 |
+| 4. Version activation and rollback | Done (M3) |
 | 5. Long-running control plane | M5 |
 | 6. Telegram transport | M6 |
 | 7. Proactive loop | M7 |
@@ -175,23 +175,38 @@ verdict. Distinguishing them would tell an attacker which half they got
 right. Replay suppression is delivery-id dedup, which M1 already
 provides.
 
-### M3 — Activation, rollback, and memory
+### M3 — Activation and rollback — **done** (memory outstanding)
 
-The largest gap between the demo and its thesis: `approve()` currently
-flips a JSON field and nothing becomes live.
+The largest gap between the demo and its thesis: `approve()` used to flip
+a JSON field and nothing became live.
 
-- `.cto/versions/<n>/` holds a materialized approved worktree.
-- `.cto/current` is a symlink; activation is an atomic rename-swap.
-- Health-check (`zig build` + `zig build test` in the materialized copy)
-  runs *before* the swap; failure aborts without touching `current`.
-- `fx cto rollback` restores the previous version; the prior known-good
-  is always retained.
-- Source branches and human git history are never rewritten.
-- `.cto/memory.jsonl` per D6, written on task completion and approval.
+- `.cto/releases/v<n>/` holds a materialized release, **detached** at an
+  immutable commit. Detached because a release is a snapshot, and git
+  refuses to check the same branch out twice — a branch-based release
+  would collide with the candidate worktree still holding it.
+- Candidate work is committed to its own `candidate/task-<n>` branch
+  first, staging only boundary-allowed paths, so build artifacts can
+  never enter a release commit and the extension boundary is enforced a
+  second time at the moment work becomes immutable. Human branches and
+  history are never written to.
+- `.cto/current` is a symlink; activation is an atomic rename-swap via
+  `symLinkAtomic`, so a reader sees the old release or the new one and
+  never a partial state.
+- Health check (`zig build` + `zig build test` in the materialized
+  release) runs *before* the swap. On failure the approval stands, the
+  task becomes `activation_failed` and retryable with `fx cto activate`,
+  and — the property that matters — the capability stays a *candidate*
+  because it is not live.
+- `fx cto rollback` repoints at the previous version; superseded releases
+  stay on disk so the move is reversible both ways.
+- The symlink, not `releases.json`, is the single source of truth for
+  what is active, so the two cannot disagree.
 
-*Done when:* approve → activate → health-check → rollback round-trips in
-a real repo, and a candidate that fails its health check leaves `current`
-untouched.
+**What activation does not do:** it does not replace the running `fx`
+binary. An operator builds or installs from `.cto/current`. Hot-swapping
+a live process stays out of scope.
+
+Still outstanding from this milestone: `.cto/memory.jsonl` per D6.
 
 ### M4 — Supervision
 

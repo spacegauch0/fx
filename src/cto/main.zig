@@ -11,6 +11,7 @@ const channel = @import("channel.zig");
 const registry = @import("extensions/registry.zig");
 const ingest_auth = @import("ingest_auth.zig");
 const secrets = @import("secrets.zig");
+const release_mod = @import("release.zig");
 
 comptime {
     _ = @import("extension_contract.zig");
@@ -106,7 +107,17 @@ fn runInner(
         return runRequest(alloc, &kernel, args, repository_path, live_runner);
     }
     if (std.mem.eql(u8, command, "approve")) {
-        return runApprove(&kernel, args);
+        return runApprove(alloc, &kernel, args, repository_path);
+    }
+    if (std.mem.eql(u8, command, "activate")) {
+        return runActivate(alloc, &kernel, args, repository_path);
+    }
+    if (std.mem.eql(u8, command, "rollback")) {
+        return runRollback(&kernel);
+    }
+    if (std.mem.eql(u8, command, "releases")) {
+        try printReleases(alloc, &kernel);
+        return 0;
     }
     if (std.mem.eql(u8, command, "review")) {
         return runReview(alloc, &kernel, args);
@@ -314,7 +325,12 @@ fn runRequest(
     return 0;
 }
 
-fn runApprove(kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
+fn runApprove(
+    alloc: std.mem.Allocator,
+    kernel: *kernel_mod.Kernel,
+    args: []const [:0]const u8,
+    repository_path: []const u8,
+) !u8 {
     if (args.len < 2) {
         std.debug.print("usage: fx cto approve <task-id>\n", .{});
         return 1;
@@ -323,11 +339,72 @@ fn runApprove(kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
         std.debug.print("fx cto approve: `{s}` is not a valid task id\n", .{args[1]});
         return 1;
     };
-    kernel.approve(id) catch |err| {
+    const repo = try store.resolveAbsolute(alloc, repository_path);
+    const outcome = kernel.approve(repo, id) catch |err| {
         std.debug.print("fx cto approve: could not approve task #{d}: {s}\n", .{ id, @errorName(err) });
         return 1;
     };
-    std.debug.print("Approved task #{d}; capability activated.\n", .{id});
+    return reportActivation(id, outcome);
+}
+
+fn runActivate(
+    alloc: std.mem.Allocator,
+    kernel: *kernel_mod.Kernel,
+    args: []const [:0]const u8,
+    repository_path: []const u8,
+) !u8 {
+    if (args.len < 2) {
+        std.debug.print("usage: fx cto activate <task-id>\n", .{});
+        return 1;
+    }
+    const id = std.fmt.parseInt(u64, args[1], 10) catch {
+        std.debug.print("fx cto activate: `{s}` is not a valid task id\n", .{args[1]});
+        return 1;
+    };
+    const repo = try store.resolveAbsolute(alloc, repository_path);
+    const outcome = kernel.activate(repo, id) catch |err| {
+        std.debug.print("fx cto activate: could not activate task #{d}: {s}\n", .{ id, @errorName(err) });
+        return 1;
+    };
+    return reportActivation(id, outcome);
+}
+
+fn reportActivation(id: u64, outcome: kernel_mod.Kernel.ActivationOutcome) u8 {
+    switch (outcome) {
+        .activated => |release| {
+            std.debug.print(
+                "Approved task #{d}. Release v{d} is built, tested, and active.\n" ++
+                    "  commit:  {s}\n  path:    {s}\n" ++
+                    "`.cto/current` now points at it; `fx cto rollback` reverts.\n",
+                .{ id, release.version, release.commit, release.path },
+            );
+            return 0;
+        },
+        .health_failed => |reason| {
+            std.debug.print(
+                "Task #{d} is approved, but the release did not activate: {s}\n" ++
+                    "The capability is still a candidate because it is not live.\n" ++
+                    "Fix the candidate and retry with `fx cto activate {d}`.\n",
+                .{ id, reason, id },
+            );
+            return 1;
+        },
+    }
+}
+
+fn runRollback(kernel: *kernel_mod.Kernel) !u8 {
+    const previous = kernel.rollback() catch |err| switch (err) {
+        error.NoActiveRelease => {
+            std.debug.print("fx cto rollback: no release is active yet\n", .{});
+            return 1;
+        },
+        error.NoPreviousRelease => {
+            std.debug.print("fx cto rollback: the active release is the first one; nothing to roll back to\n", .{});
+            return 1;
+        },
+        else => return err,
+    };
+    std.debug.print("Rolled back to release v{d} ({s}).\n", .{ previous.version, previous.path });
     return 0;
 }
 
@@ -344,11 +421,18 @@ fn runChannel(kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
         .runs => printRuns(kernel),
         .decisions => printDecisions(kernel),
         .approve => |id| {
-            kernel.approve(id) catch |err| {
-                std.debug.print("approval failed: {s}\n", .{@errorName(err)});
-                return 1;
-            };
-            std.debug.print("approved task #{d}\n", .{id});
+            // Decision D5 (docs/CTO_ROADMAP.md): approving a self-modifying
+            // candidate activates new code, and this bridge is designed to
+            // be driven by transports authenticated only by something as
+            // weak as a chat ID. The refusal lives here, at the boundary,
+            // rather than in a future bot that would have to remember it.
+            std.debug.print(
+                "task #{d} needs approval from the local CLI: `fx cto approve {d}`\n" ++
+                    "Approving a candidate activates self-modifying code, which is not\n" ++
+                    "delegated to a remote channel.\n",
+                .{ id, id },
+            );
+            return 1;
         },
         .interrupt => |id| {
             std.debug.print("task #{d} interruption is not implemented yet; worker cancellation is a planned daemon capability.\n", .{id});
@@ -377,7 +461,10 @@ fn printHelp() void {
         \\  ingest <event> <id>       Admit and normalize a raw event body (stdin)
         \\  observations              List recorded observations
         \\  review <task-id>          Show the candidate extension diff
-        \\  approve <task-id>         Activate a candidate awaiting approval
+        \\  approve <task-id>         Approve and activate a candidate
+        \\  activate <task-id>        Retry activation of an approved candidate
+        \\  releases                  List versioned releases and the active one
+        \\  rollback                  Point the active release at the previous version
         \\  events                    Show the append-only audit journal
         \\
     , .{});
@@ -445,6 +532,27 @@ fn printRuns(kernel: *kernel_mod.Kernel) void {
     }
     for (kernel.runs.items) |worker_run| {
         std.debug.print("#{d} task #{d} [{s}] {s}\n", .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker });
+    }
+}
+
+fn printReleases(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel) !void {
+    if (kernel.releases.items.len == 0) {
+        std.debug.print("no releases yet\n", .{});
+        return;
+    }
+    // The symlink, not the metadata file, decides which release is live.
+    const current = try release_mod.readCurrent(alloc, kernel.cto_root);
+    defer if (current) |value| alloc.free(value);
+
+    for (kernel.releases.items) |release| {
+        const active = if (current) |value| std.mem.eql(u8, value, release.path) else false;
+        std.debug.print("v{d}{s} task #{d} {s} {s}\n", .{
+            release.version,
+            if (active) " (active)" else "",
+            release.task_id,
+            release.capability,
+            release.commit,
+        });
     }
 }
 
