@@ -95,8 +95,12 @@ pub const Runtime = struct {
             \\Implement the missing capability `github.pull_request.merged`.
             \\The implementation must:
             \\- live behind the CTO extension/connector boundary (src/cto/extensions/)
-            \\- normalize observations into CTO events
-            \\- add tests/fixtures
+            \\- export an `extension_contract.Connector`
+            \\- accept `extension_contract.RawEvent` and return a provider-neutral `observation.Observation`
+            \\- handle only the GitHub `pull_request` event with action `closed` and merged=true
+            \\- preserve delivery id, repository, PR URL, author, merger, head SHA, base branch, title, number, and merge time
+            \\- include deterministic JSON fixtures and co-located tests under src/cto/extensions/
+            \\- register the connector in src/cto/extensions/registry.zig so its tests enter the build graph
             \\- avoid modifying the trusted kernel's audit, policy, or activation code
             \\- avoid activating itself
             \\- return a candidate for human approval
@@ -142,11 +146,11 @@ pub const Runtime = struct {
         };
         defer self.allocator.free(validation.log);
 
-        if (!validation.build_ok or !validation.test_ok) {
+        if (!validation.boundary_ok or !validation.build_ok or !validation.test_ok) {
             const reason = try std.fmt.allocPrint(
                 self.allocator,
-                "candidate failed validation (build_ok={} test_ok={}) in {s}",
-                .{ validation.build_ok, validation.test_ok, worktree_path },
+                "candidate failed validation (boundary_ok={} build_ok={} test_ok={}) in {s}",
+                .{ validation.boundary_ok, validation.build_ok, validation.test_ok, worktree_path },
             );
             defer self.allocator.free(reason);
             try self.kernel.markFailed(task_id, reason);

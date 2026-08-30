@@ -29,3 +29,15 @@ The connector should:
 4. preserve provenance;
 5. never activate itself;
 6. rely on the kernel for approval and version switching.
+
+## Contract
+
+Self-generated connectors implement `src/cto/extension_contract.zig` and
+produce the owned, provider-neutral observations defined in
+`src/cto/observation.zig`. Candidate validation rejects changes outside
+this directory (apart from the durable task prompt), and `fx cto review
+<task-id>` shows the complete extension diff before approval.
+
+Every candidate must also update `registry.zig`. That registry is imported
+by the CTO composition root, which ensures an approved connector and its
+co-located tests enter the normal Zig build graph.

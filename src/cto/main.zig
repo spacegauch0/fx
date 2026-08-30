@@ -2,10 +2,16 @@ const std = @import("std");
 const io_mod = @import("../core/shared/io.zig");
 
 const fx_worker_mod = @import("fx_worker.zig");
+const git = @import("git.zig");
 const kernel_mod = @import("kernel.zig");
 const runtime_mod = @import("runtime.zig");
 const store = @import("store.zig");
 const task_mod = @import("task.zig");
+
+comptime {
+    _ = @import("extension_contract.zig");
+    _ = @import("extensions/registry.zig");
+}
 
 const default_cto_root = ".cto";
 const default_repository_path = ".";
@@ -77,10 +83,43 @@ fn runInner(
     if (std.mem.eql(u8, command, "approve")) {
         return runApprove(&kernel, args);
     }
+    if (std.mem.eql(u8, command, "review")) {
+        return runReview(alloc, &kernel, args);
+    }
 
     std.debug.print("fx cto: unknown command `{s}`\n\n", .{command});
     printHelp();
     return 1;
+}
+
+fn runReview(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
+    if (args.len < 2) {
+        std.debug.print("usage: fx cto review <task-id>\n", .{});
+        return 1;
+    }
+    const id = std.fmt.parseInt(u64, args[1], 10) catch {
+        std.debug.print("fx cto review: `{s}` is not a valid task id\n", .{args[1]});
+        return 1;
+    };
+    const task = kernel.findTask(id) orelse {
+        std.debug.print("fx cto review: task #{d} was not found\n", .{id});
+        return 1;
+    };
+    const worktree_path = task.worktree_path orelse {
+        std.debug.print("fx cto review: task #{d} has no candidate worktree\n", .{id});
+        return 1;
+    };
+    const diff = git.extensionDiff(alloc, worktree_path) catch |err| {
+        std.debug.print("fx cto review: could not render task #{d}: {s}\n", .{ id, @errorName(err) });
+        return 1;
+    };
+    defer alloc.free(diff);
+    if (diff.len == 0) {
+        std.debug.print("task #{d} has no extension changes\n", .{id});
+    } else {
+        std.debug.print("{s}", .{diff});
+    }
+    return 0;
 }
 
 fn isHelp(command: []const u8) bool {
@@ -162,6 +201,7 @@ fn printHelp() void {
         \\  capabilities              List every known capability and its status
         \\  request "<objective>"     Ask CTO to pursue an outcome
         \\  tasks                     List tasks and their lifecycle status
+        \\  review <task-id>          Show the candidate extension diff
         \\  approve <task-id>         Activate a candidate awaiting approval
         \\  events                    Show the append-only audit journal
         \\
