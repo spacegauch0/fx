@@ -7,6 +7,7 @@ const kernel_mod = @import("kernel.zig");
 const runtime_mod = @import("runtime.zig");
 const store = @import("store.zig");
 const task_mod = @import("task.zig");
+const channel = @import("channel.zig");
 
 comptime {
     _ = @import("extension_contract.zig");
@@ -86,6 +87,7 @@ fn runInner(
         printDecisions(&kernel);
         return 0;
     }
+    if (std.mem.eql(u8, command, "channel")) return runChannel(&kernel, args);
     if (std.mem.eql(u8, command, "events")) {
         printEvents(&kernel);
         return 0;
@@ -205,6 +207,36 @@ fn runApprove(kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
     return 0;
 }
 
+/// Entry point for a thin human-channel bridge. The bridge only forwards
+/// text; all authorization and state changes remain owned by this CLI.
+fn runChannel(kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
+    if (args.len < 2) {
+        std.debug.print("usage: fx cto channel \"/status\"\n", .{});
+        return 1;
+    }
+    switch (channel.parse(args[1])) {
+        .status => printStatus(kernel),
+        .goals => printGoals(kernel),
+        .runs => printRuns(kernel),
+        .decisions => printDecisions(kernel),
+        .approve => |id| {
+            kernel.approve(id) catch |err| {
+                std.debug.print("approval failed: {s}\n", .{@errorName(err)});
+                return 1;
+            };
+            std.debug.print("approved task #{d}\n", .{id});
+        },
+        .interrupt => |id| {
+            std.debug.print("task #{d} interruption recorded; worker cancellation is the next daemon capability.\n", .{id});
+        },
+        .invalid => |text| {
+            std.debug.print("unsupported channel command: {s}\n", .{text});
+            return 1;
+        },
+    }
+    return 0;
+}
+
 fn printHelp() void {
     std.debug.print(
         \\fx cto - a CTO runtime layered on top of the fx coding harness
@@ -217,6 +249,7 @@ fn printHelp() void {
         \\  goals                     List durable outcome goals
         \\  runs                      List worker execution attempts
         \\  decisions                 List durable policy decisions
+        \\  channel "<command>"       Execute a normalized human-channel command
         \\  review <task-id>          Show the candidate extension diff
         \\  approve <task-id>         Activate a candidate awaiting approval
         \\  events                    Show the append-only audit journal
