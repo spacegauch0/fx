@@ -23,6 +23,7 @@ pub const EventKind = enum {
     run_finished,
     observation_recorded,
     observation_duplicate,
+    ingest_rejected,
 };
 
 pub const Event = struct {

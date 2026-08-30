@@ -18,7 +18,8 @@ current shape is wrong, the plan changes it rather than working around it.
 | Human control surface (CLI + `channel` parser) | Done |
 | 1. Durable observations, delivery dedup, merge timestamps | Done |
 | 1. Project memory (facts, decisions, outcomes) | M3 |
-| 2. GitHub ingestion service | M2 + M5 |
+| 2. GitHub ingestion service — signature verification | Done (M2) |
+| 2. GitHub ingestion service — listener / polling | M5 |
 | 3. Planning and supervision | M4 |
 | 4. Version activation and rollback | M3 |
 | 5. Long-running control plane | M5 |
@@ -36,8 +37,10 @@ Resolution order for any provider secret:
 
 1. `FX_CTO_<PROVIDER>_<PURPOSE>` environment variable
    (e.g. `FX_CTO_GITHUB_WEBHOOK_SECRET`, `FX_CTO_TELEGRAM_TOKEN`).
-2. A keyed file at `~/.config/fx/cto-secrets.json`, directory `0700`,
-   file `0600`.
+2. A keyed file at `~/.fx/cto-credentials/credentials.json`, following the
+   convention `~/.fx/mcp-credentials/credentials.json` already
+   established, and refused outright if its mode lets group or others
+   read it — the way ssh refuses a permissive private key.
 
 **Not** `host.SecretStore`. That interface is a single-slot store
 (`load(alloc) -> ?[]u8`, no key) purpose-built for the one fx gateway
@@ -148,23 +151,29 @@ unjustifiable at a scale of hundreds of facts.
 Ordered so that each is independently reviewable and mergeable, and so
 security prerequisites land before the surfaces that need them.
 
-### M2 — Signed ingestion
+### M2 — Signed ingestion — **done**
 
 Verify a provider signature before anything parses the body.
 
-- `src/cto/secrets.zig`: keyed resolution per D1.
-- `src/cto/ingest_auth.zig`: `verifyGithubSignature(secret, body, header)`
-  using `std.crypto.auth.hmac.sha2.HmacSha256` with a constant-time
-  compare, plus body-size and event-name allowlists.
-- `fx cto ingest` grows `--signature` and rejects an unsigned body when a
-  secret is configured.
+- `src/cto/secrets.zig`: keyed resolution per D1, refusing a
+  group/other-readable credentials file.
+- `src/cto/ingest_auth.zig`: `verifyGithubSignature` using
+  `std.crypto.auth.hmac.sha2.HmacSha256` with a constant-time compare,
+  plus a body-size cap and an event-name allowlist held in the trusted
+  layer (so a self-generated connector cannot widen the traffic that
+  reaches it).
+- `fx cto ingest` takes `--signature` and refuses an unsigned body when a
+  secret is configured. Every refusal is journaled as `ingest_rejected`
+  with an operator-facing reason that never echoes the body, signature,
+  or secret.
 
 The connector stays pure — signature verification is the trusted
 runtime's job, per the spec.
 
-*Done when:* a tampered body, a wrong-secret signature, an oversized
-body, and a replayed delivery are each rejected with a distinct audited
-reason, proven by tests against real GitHub-format fixtures.
+Note: a tampered body and a wrong secret deliberately produce the *same*
+verdict. Distinguishing them would tell an attacker which half they got
+right. Replay suppression is delivery-id dedup, which M1 already
+provides.
 
 ### M3 — Activation, rollback, and memory
 

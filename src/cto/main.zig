@@ -9,6 +9,8 @@ const store = @import("store.zig");
 const task_mod = @import("task.zig");
 const channel = @import("channel.zig");
 const registry = @import("extensions/registry.zig");
+const ingest_auth = @import("ingest_auth.zig");
+const secrets = @import("secrets.zig");
 
 comptime {
     _ = @import("extension_contract.zig");
@@ -145,23 +147,68 @@ fn runReview(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const
     return 0;
 }
 
-/// Feeds one raw provider event (JSON body on stdin) through every
-/// registered connector (`extensions/registry.zig`). A connector that
-/// returns an observation gets it recorded (deduplicated by
-/// provider+delivery id); nothing here trusts the event beyond that —
-/// there is no signature verification and no network I/O, so this is only
-/// as trustworthy as whatever fed it the body.
+/// Feeds one raw provider event (JSON body on stdin) through the trusted
+/// admission layer and then every registered connector
+/// (`extensions/registry.zig`). A connector that returns an observation
+/// gets it recorded, deduplicated by provider+delivery id.
+///
+/// Admission (size limit, event allowlist, HMAC signature) happens before
+/// any connector sees the body. When a webhook secret is configured, an
+/// unsigned or wrongly-signed body is refused; with no secret configured
+/// an unsigned body is accepted, which is appropriate only because this
+/// path is a local human piping a fixture, never a network listener.
 fn runIngest(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
     if (args.len < 3) {
-        std.debug.print("usage: fx cto ingest <event-name> <delivery-id> < body.json\n", .{});
+        std.debug.print(
+            "usage: fx cto ingest <event-name> <delivery-id> [--signature sha256=...] < body.json\n",
+            .{},
+        );
         return 1;
     }
     const event_name = args[1];
     const delivery_id = args[2];
-    const body = readStdinAlloc(alloc, 4 * 1024 * 1024) catch |err| {
+
+    var signature_header: ?[]const u8 = null;
+    var index: usize = 3;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--signature")) {
+            index += 1;
+            if (index >= args.len) {
+                std.debug.print("fx cto ingest: --signature requires a value\n", .{});
+                return 1;
+            }
+            signature_header = args[index];
+        } else {
+            std.debug.print("fx cto ingest: unexpected argument `{s}`\n", .{args[index]});
+            return 1;
+        }
+    }
+
+    const body = readStdinAlloc(alloc, ingest_auth.max_body_bytes + 1) catch |err| {
         std.debug.print("fx cto ingest: could not read the event body from stdin: {s}\n", .{@errorName(err)});
         return 1;
     };
+
+    const secret = resolveWebhookSecret(alloc) catch |err| {
+        std.debug.print("fx cto ingest: could not resolve the webhook secret: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer if (secret) |value| {
+        @memset(value, 0);
+        alloc.free(value);
+    };
+
+    const verdict = ingest_auth.admit(.{
+        .event_name = event_name,
+        .body = body,
+        .signature_header = signature_header,
+        .secret = secret,
+    });
+    if (!verdict.admitted()) {
+        try kernel.recordIngestRejection(event_name, verdict.reason());
+        std.debug.print("fx cto ingest: rejected — {s}\n", .{verdict.reason()});
+        return 1;
+    }
 
     if (registry.connectors.len == 0) {
         std.debug.print("no connectors are registered yet\n", .{});
@@ -197,6 +244,14 @@ fn runIngest(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const
         );
     }
     return 0;
+}
+
+/// Resolves the GitHub webhook secret, or null when none is configured.
+/// A missing HOME is treated as "no credentials file", not an error, so
+/// the environment variable still works in a bare container.
+fn resolveWebhookSecret(alloc: std.mem.Allocator) !?[]u8 {
+    const home = io_mod.getenv("HOME") orelse return null;
+    return secrets.resolve(alloc, home, .github_webhook_secret);
 }
 
 fn readStdinAlloc(alloc: std.mem.Allocator, max_bytes: usize) ![]u8 {
@@ -319,7 +374,7 @@ fn printHelp() void {
         \\  runs                      List worker execution attempts
         \\  decisions                 List durable policy decisions
         \\  channel "<command>"       Execute a normalized human-channel command
-        \\  ingest <event> <id>       Normalize a raw event body (stdin) via registered connectors
+        \\  ingest <event> <id>       Admit and normalize a raw event body (stdin)
         \\  observations              List recorded observations
         \\  review <task-id>          Show the candidate extension diff
         \\  approve <task-id>         Activate a candidate awaiting approval

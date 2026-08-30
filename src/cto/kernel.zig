@@ -156,6 +156,13 @@ pub const Kernel = struct {
         return true;
     }
 
+    /// Audits a raw event the trusted admission layer refused. The reason
+    /// is the operator-facing `Verdict.reason()` text, which never carries
+    /// any part of the body, signature, or secret.
+    pub fn recordIngestRejection(self: *Kernel, event_name: []const u8, reason: []const u8) !void {
+        _ = try self.journal.append(.ingest_rejected, event_name, reason);
+    }
+
     fn persistCapabilities(self: *Kernel) !void {
         try store.saveCapabilities(self.allocator, self.cto_root, &self.capabilities);
     }
