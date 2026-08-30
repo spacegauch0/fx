@@ -227,7 +227,7 @@ fn runChannel(kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
             std.debug.print("approved task #{d}\n", .{id});
         },
         .interrupt => |id| {
-            std.debug.print("task #{d} interruption recorded; worker cancellation is the next daemon capability.\n", .{id});
+            std.debug.print("task #{d} interruption is not implemented yet; worker cancellation is a planned daemon capability.\n", .{id});
         },
         .invalid => |text| {
             std.debug.print("unsupported channel command: {s}\n", .{text});
