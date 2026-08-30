@@ -81,6 +81,10 @@ fn runInner(
         printRuns(&kernel);
         return 0;
     }
+    if (std.mem.eql(u8, command, "decisions")) {
+        printDecisions(&kernel);
+        return 0;
+    }
     if (std.mem.eql(u8, command, "events")) {
         printEvents(&kernel);
         return 0;
@@ -211,6 +215,7 @@ fn printHelp() void {
         \\  tasks                     List tasks and their lifecycle status
         \\  goals                     List durable outcome goals
         \\  runs                      List worker execution attempts
+        \\  decisions                 List durable policy decisions
         \\  review <task-id>          Show the candidate extension diff
         \\  approve <task-id>         Activate a candidate awaiting approval
         \\  events                    Show the append-only audit journal
@@ -281,6 +286,20 @@ fn printRuns(kernel: *kernel_mod.Kernel) void {
     for (kernel.runs.items) |worker_run| {
         std.debug.print("#{d} task #{d} [{s}] {s}\n", .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker });
     }
+}
+
+fn printDecisions(kernel: *kernel_mod.Kernel) void {
+    var found = false;
+    for (kernel.journal.events.items) |event| {
+        switch (event.kind) {
+            .policy_allowed, .policy_approval_required, .policy_denied => {
+                found = true;
+                std.debug.print("#{d} [{s}] {s} {s}\n", .{ event.sequence, @tagName(event.kind), event.subject, event.detail });
+            },
+            else => {},
+        }
+    }
+    if (!found) std.debug.print("no policy decisions yet\n", .{});
 }
 
 fn printEvents(kernel: *kernel_mod.Kernel) void {
