@@ -153,6 +153,8 @@ const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
 const approval_prompt = @import("core/permissions/approval_prompt.zig");
 const cto_main = @import("cto/main.zig");
+const cto_worker = @import("cto/worker.zig");
+const cli_ask = @import("core/cli/cli_ask.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -3093,7 +3095,12 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
     // spawns git/zig subprocesses whose PATH resolution must match the
     // invoking shell's, not some default search path.
     if (cli_args.len > 0 and std.mem.eql(u8, cli_args[0], "cto")) {
-        exitFast(cto_main.run(processAllocator(), cli_args[1..], environBlockFromRaw(raw_env)));
+        exitFast(cto_main.run(
+            processAllocator(),
+            cli_args[1..],
+            environBlockFromRaw(raw_env),
+            .{ .run_fn = runCtoFxWorker },
+        ));
     }
     if (command_runner.isForegroundSessionInvocation(cli_args)) {
         io_mod.setRawEnviron(raw_env);
@@ -3116,6 +3123,42 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
         exitFast(0);
     }
     try runNonBenchmark(raw_args, raw_env, cli_args);
+}
+
+fn runCtoFxWorker(
+    _: ?*anyopaque,
+    alloc: Allocator,
+    request: cto_worker.WorkRequest,
+) !cto_worker.WorkResult {
+    const original_cwd = try io_mod.realpathAlloc(alloc, ".");
+    defer alloc.free(original_cwd);
+
+    try std.process.setCurrentPath(io_mod.getIo(), request.worktree_path);
+    var restore_needed = true;
+    defer if (restore_needed) std.process.setCurrentPath(io_mod.getIo(), original_cwd) catch {};
+
+    const prompt_z = try alloc.dupeZ(u8, request.prompt);
+    defer alloc.free(prompt_z);
+    const surface_cfg = app_entry_runtime.cliSurfaceConfig(fullEntryConfig());
+    const ask_cfg = cli_surface.workflowConfig(surface_cfg);
+    const exit_code = try cli_ask.run(
+        alloc,
+        &.{ "--yolo", "--no-save", prompt_z },
+        ask_cfg,
+        default_context_registry,
+        builtin_tools.advertisement_set,
+    );
+
+    try std.process.setCurrentPath(io_mod.getIo(), original_cwd);
+    restore_needed = false;
+    return .{
+        .success = exit_code == 0,
+        .summary = try std.fmt.allocPrint(
+            alloc,
+            "fx agent ({s}) in {s}",
+            .{ if (exit_code == 0) "succeeded" else "failed", request.worktree_path },
+        ),
+    };
 }
 
 fn writeTopLevelHelpFast(raw_env: RawEnviron) !void {

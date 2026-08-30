@@ -34,13 +34,14 @@ pub const Runtime = struct {
         kernel: *kernel_mod.Kernel,
         repository_path: []const u8,
         dispatch: fx_worker_mod.DispatchMode,
+        live_runner: ?fx_worker_mod.LiveRunner,
     ) Runtime {
         return .{
             .allocator = allocator,
             .kernel = kernel,
             .counterpart = counterpart_mod.Counterpart.ctoDev(repository_path),
             .workspace = workspace_mod.Workspace.init(allocator, repository_path, kernel.cto_root),
-            .fx_worker = .{ .dispatch = dispatch },
+            .fx_worker = .{ .dispatch = dispatch, .live_runner = live_runner },
         };
     }
 
@@ -197,7 +198,7 @@ test "request returns null and does not create a task when nothing is missing" {
     const cto_root = try std.fs.path.join(alloc, &.{ root, ".cto" });
 
     var kernel = try kernel_mod.Kernel.init(alloc, cto_root);
-    var runtime = Runtime.init(alloc, &kernel, root, .dry_run);
+    var runtime = Runtime.init(alloc, &kernel, root, .dry_run, null);
 
     const task_id = try runtime.request("refactor the billing service");
     try std.testing.expect(task_id == null);
@@ -224,7 +225,7 @@ test "request records a failed task rather than crashing when the worktree canno
     try runGitOrFail(alloc, &.{ "git", "-C", root, "branch", "candidate/task-1" });
 
     var kernel = try kernel_mod.Kernel.init(alloc, cto_root);
-    var runtime = Runtime.init(alloc, &kernel, root, .dry_run);
+    var runtime = Runtime.init(alloc, &kernel, root, .dry_run, null);
 
     const task_id = try runtime.request("watch merged pull requests");
     try std.testing.expect(task_id != null);

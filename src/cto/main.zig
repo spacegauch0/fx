@@ -19,7 +19,12 @@ const default_repository_path = ".";
 /// `environ_block` is the real process environment: git/zig subprocess
 /// spawning and `FX_CTO_DISPATCH_WORKER` both need it, not a default search
 /// path baked into a bare `Threaded.init`.
-pub fn run(gpa: std.mem.Allocator, args: []const [:0]const u8, environ_block: std.process.Environ.Block) u8 {
+pub fn run(
+    gpa: std.mem.Allocator,
+    args: []const [:0]const u8,
+    environ_block: std.process.Environ.Block,
+    live_runner: ?fx_worker_mod.LiveRunner,
+) u8 {
     var threaded = std.Io.Threaded.init(gpa, .{ .environ = .{ .block = environ_block } });
     defer threaded.deinit();
     io_mod.setIo(threaded.io());
@@ -28,7 +33,7 @@ pub fn run(gpa: std.mem.Allocator, args: []const [:0]const u8, environ_block: st
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
 
-    return runInner(arena.allocator(), args, default_cto_root, default_repository_path) catch |err| {
+    return runInner(arena.allocator(), args, default_cto_root, default_repository_path, live_runner) catch |err| {
         std.debug.print("fx cto: {s}\n", .{@errorName(err)});
         return 1;
     };
@@ -39,6 +44,7 @@ fn runInner(
     args: []const [:0]const u8,
     cto_root: []const u8,
     repository_path: []const u8,
+    live_runner: ?fx_worker_mod.LiveRunner,
 ) !u8 {
     if (args.len == 0 or isHelp(args[0])) {
         printHelp();
@@ -66,7 +72,7 @@ fn runInner(
         return 0;
     }
     if (std.mem.eql(u8, command, "request")) {
-        return runRequest(alloc, &kernel, args, repository_path);
+        return runRequest(alloc, &kernel, args, repository_path, live_runner);
     }
     if (std.mem.eql(u8, command, "approve")) {
         return runApprove(&kernel, args);
@@ -88,6 +94,7 @@ fn runRequest(
     kernel: *kernel_mod.Kernel,
     args: []const [:0]const u8,
     repository_path: []const u8,
+    live_runner: ?fx_worker_mod.LiveRunner,
 ) !u8 {
     if (args.len < 2) {
         std.debug.print("usage: fx cto request \"<objective>\"\n", .{});
@@ -101,6 +108,7 @@ fn runRequest(
         kernel,
         absolute_repository_path,
         fx_worker_mod.dispatchModeFromEnv(),
+        live_runner,
     );
     const task_id = try runtime.request(objective);
 
@@ -265,14 +273,14 @@ test "runInner routes status, capabilities, request, tasks, events, and approve"
         alloc.free(result.stderr);
     }
 
-    try std.testing.expectEqual(@as(u8, 0), try runInner(alloc, &.{"status"}, cto_root, root));
-    try std.testing.expectEqual(@as(u8, 0), try runInner(alloc, &.{"capabilities"}, cto_root, root));
-    try std.testing.expectEqual(@as(u8, 0), try runInner(alloc, &.{"tasks"}, cto_root, root));
-    try std.testing.expectEqual(@as(u8, 0), try runInner(alloc, &.{"events"}, cto_root, root));
+    try std.testing.expectEqual(@as(u8, 0), try runInner(alloc, &.{"status"}, cto_root, root, null));
+    try std.testing.expectEqual(@as(u8, 0), try runInner(alloc, &.{"capabilities"}, cto_root, root, null));
+    try std.testing.expectEqual(@as(u8, 0), try runInner(alloc, &.{"tasks"}, cto_root, root, null));
+    try std.testing.expectEqual(@as(u8, 0), try runInner(alloc, &.{"events"}, cto_root, root, null));
 
     try std.testing.expectEqual(
         @as(u8, 0),
-        try runInner(alloc, &.{ "request", "watch merged pull requests" }, cto_root, root),
+        try runInner(alloc, &.{ "request", "watch merged pull requests" }, cto_root, root, null),
     );
 
     var kernel = try kernel_mod.Kernel.init(alloc, cto_root);
@@ -280,7 +288,7 @@ test "runInner routes status, capabilities, request, tasks, events, and approve"
     try std.testing.expectEqual(@as(usize, 1), kernel.tasks.items.len);
     try std.testing.expectEqual(task_mod.TaskStatus.failed, kernel.tasks.items[0].status);
 
-    try std.testing.expectEqual(@as(u8, 1), try runInner(alloc, &.{"unknown-command"}, cto_root, root));
-    try std.testing.expectEqual(@as(u8, 1), try runInner(alloc, &.{ "approve", "not-a-number" }, cto_root, root));
-    try std.testing.expectEqual(@as(u8, 1), try runInner(alloc, &.{ "approve", "999" }, cto_root, root));
+    try std.testing.expectEqual(@as(u8, 1), try runInner(alloc, &.{"unknown-command"}, cto_root, root, null));
+    try std.testing.expectEqual(@as(u8, 1), try runInner(alloc, &.{ "approve", "not-a-number" }, cto_root, root, null));
+    try std.testing.expectEqual(@as(u8, 1), try runInner(alloc, &.{ "approve", "999" }, cto_root, root, null));
 }

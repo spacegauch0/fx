@@ -51,7 +51,7 @@ flowchart TD
 
     R --> G[git.zig: create worktree]
     G --> W[fx Worker — fx_worker.zig]
-    W -->|dry-run or FX_CTO_DISPATCH_WORKER=1| FX[fx ask, in the worktree]
+    W -->|dry-run or FX_CTO_DISPATCH_WORKER=1| FX[fx headless agent runtime, in the worktree]
     R --> V[candidate.zig: zig build + zig build test]
     V --> K
     K -->|approval_required| H
@@ -68,7 +68,7 @@ flowchart TD
 | `store.zig` | all `.cto/` JSON/JSONL persistence — the only file I/O in the kernel |
 | `counterpart.zig` | the fixed `cto-dev` engineer identity |
 | `worker.zig` | the type-erased worker interface |
-| `fx_worker.zig` | the one worker implementation: re-execs `fx ask` inside a worktree |
+| `fx_worker.zig` | adapter to the headless fx agent runtime injected by the composition root |
 | `git.zig` | `git worktree add`, nothing else |
 | `candidate.zig` | runs `zig build` / `zig build test` inside a worktree |
 | `workspace.zig` | pure path formatting (worktree path, candidate branch name) |
@@ -128,18 +128,17 @@ capability, not proving it can poll GitHub's API.
 
 1. writes the implementation prompt to `<worktree>/.cto-task-prompt.md` as a
    durable record of what cto-dev was asked to do;
-2. resolves the path to re-exec the currently running `fx` binary
-   (`self_exe.pathForPeerReexec`, the same helper fx's own upgrade/restart
-   paths use);
-3. either stops there (the default — see below) or actually runs
-   `fx ask --yolo --no-save "<prompt>"` with that binary, inside the
-   worktree.
+2. stops there in dry-run mode (the default — see below), or calls a typed
+   runner injected by `src/main.zig`;
+3. in live mode, switches into the isolated worktree and invokes fx's
+   existing `cli_ask` headless agent/session runtime directly with yolo
+   permissions and session persistence disabled.
 
 **Dispatch is dry-run by default.** A bare `fx cto request` must never
 silently spend model credits, need network access, or need live
 credentials just to demonstrate the bootstrap loop — and this PoC was
 built and tested in a sandboxed environment with no model access at all.
-Set `FX_CTO_DISPATCH_WORKER=1` to have it actually invoke `fx ask` live.
+Set `FX_CTO_DISPATCH_WORKER=1` to have it invoke the fx agent runtime live.
 `--yolo` (fx's existing flag to skip its own permission prompts) is safe
 here specifically because the worker only ever runs inside the isolated
 worktree the kernel just created — the isolation boundary is the worktree
@@ -152,7 +151,7 @@ and records the actual pass/fail, whether or not a live model touched the
 code. In dry-run mode this mostly proves the pipeline (worktree → build →
 test → candidate → approval) end to end against an unmodified checkout;
 with `FX_CTO_DISPATCH_WORKER=1` and real model credentials it validates
-whatever `fx ask` actually changed.
+whatever the fx agent actually changed.
 
 ## Self-modification safety
 
@@ -179,7 +178,7 @@ whatever `fx ask` actually changed.
   works; it does not yet contain a `github_events.zig` extension, because
   today's worker run is dry-run by default and nothing generates one. The
   next iteration is running this with `FX_CTO_DISPATCH_WORKER=1` and real
-  model credentials so `fx ask` actually writes
+  model credentials so the fx agent actually writes
   `src/cto/extensions/github_events.zig`.
 - **Activation is registry-only.** Approving a task flips
   `.cto/capabilities.json`; it does not merge the candidate branch, restart
