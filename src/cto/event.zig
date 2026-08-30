@@ -21,6 +21,8 @@ pub const EventKind = enum {
     policy_denied,
     run_started,
     run_finished,
+    observation_recorded,
+    observation_duplicate,
 };
 
 pub const Event = struct {

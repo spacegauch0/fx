@@ -153,6 +153,46 @@ test → candidate → approval) end to end against an unmodified checkout;
 with `FX_CTO_DISPATCH_WORKER=1` and real model credentials it validates
 whatever the fx agent actually changed.
 
+## Observations, connectors, and ingestion
+
+`extension_contract.zig` defines the seam a connector implements:
+`Connector.normalize(RawEvent) -> ?Observation`, where a raw event is just
+`{event_name, delivery_id, body}` and an `Observation` (`observation.zig`)
+is a provider-neutral fact with provenance (provider, delivery id,
+repository, URL). `src/cto/extensions/github_events.zig` is the first
+connector: it normalizes a GitHub `pull_request` webhook only when
+`action: closed` and `merged: true`, and it's registered in
+`extensions/registry.zig` so its tests run in the normal `zig build test`
+graph.
+
+`fx cto ingest <event-name> <delivery-id>` reads a raw event body from
+stdin and runs it through every registered connector. An observation a
+connector produces is deduplicated by `(provider, delivery_id)` and
+persisted to `.cto/observations.jsonl`; `fx cto observations` lists what's
+been recorded. This is deliberately the boring half of "ingestion": there
+is no webhook receiver, no signature verification, and no network I/O
+here — something else has to hand `fx cto ingest` a trusted body. See
+Limitations.
+
+```console
+$ echo '{"action":"closed","pull_request":{"number":42,"merged":true,"merged_at":"2024-01-15T10:30:00Z", ...}}' \
+    | fx cto ingest pull_request delivery-abc
+connector `github-events` recorded an observation for `github.pull_request.merged`
+$ fx cto observations
+[github] org/repo#42 "..." merged by ... (delivery-abc)
+```
+
+## Human-channel bridge
+
+`channel.zig` parses Telegram-style slash text (`/status`, `/goals`,
+`/runs`, `/decisions`, `/approve <id>`, `/interrupt <id>`) into a
+provider-neutral `Command`. `fx cto channel "<command>"` dispatches it —
+but only ever to the same views and actions the rest of the CLI already
+exposes (`kernel.approve`, the same printers). It grants no new authority;
+it's a second entry point onto the existing one, with no network
+transport or bot credential wired up yet. `/interrupt` is an honest
+no-op today (worker cancellation isn't implemented).
+
 ## Self-modification safety
 
 - Self-generated work happens only inside `.cto/worktrees/task-<id>/`, a
@@ -174,12 +214,20 @@ whatever the fx agent actually changed.
 
 ## Known limitations / what's next
 
-- **No live GitHub connector yet.** A candidate build proves the pipeline
-  works; it does not yet contain a `github_events.zig` extension, because
-  today's worker run is dry-run by default and nothing generates one. The
-  next iteration is running this with `FX_CTO_DISPATCH_WORKER=1` and real
-  model credentials so the fx agent actually writes
-  `src/cto/extensions/github_events.zig`.
+- **No webhook receiver, no Telegram transport, no daemon.** `fx cto
+  ingest` and `fx cto channel` are the trusted-side halves of ingestion
+  and human control; nothing here listens on a socket, verifies a webhook
+  signature, or authenticates a Telegram chat. A long-running process that
+  does that — plus an authenticated local API, retries/timeouts/deadlines
+  for workers, `/interrupt` actually cancelling a run, and durable
+  project-memory beyond raw observations — is real, security-sensitive
+  infrastructure work that's deliberately not in this PoC. See
+  `docs/SPEC.md` for the fuller roadmap this PR was scoped against.
+- **The GitHub connector was authored directly, not generated live.** This
+  PoC has no model credentials to actually drive `fx cto request` through
+  a live worker run, so `github_events.zig` is a reviewed, hand-written
+  reference implementation of the target shape — not evidence that the
+  live loop reliably generates working connectors end to end.
 - **Activation is registry-only.** Approving a task flips
   `.cto/capabilities.json`; it does not merge the candidate branch, restart
   the running binary, or otherwise make the new code live. That "atomic
@@ -207,10 +255,16 @@ whatever the fx agent actually changed.
 $ mkdir /tmp/demo && cd /tmp/demo && git init -q && git commit -q --allow-empty -m seed
 $ fx cto status
 $ fx cto request "watch merged pull requests"
+$ fx cto goals
+$ fx cto runs
+$ fx cto decisions
 $ fx cto tasks
 $ fx cto events
 $ fx cto approve 1
 $ fx cto capabilities
+$ echo '{"action":"closed","pull_request":{"number":1,"merged":true,"merged_at":"2024-01-15T10:30:00Z","title":"...","html_url":"...","user":{"login":"..."},"merged_by":{"login":"..."},"head":{"sha":"..."},"base":{"ref":"main"}},"repository":{"full_name":"org/repo"}}' \
+    | fx cto ingest pull_request delivery-1
+$ fx cto observations
 ```
 
 This runs entirely offline (dry-run worker) and still exercises the real

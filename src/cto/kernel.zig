@@ -9,6 +9,7 @@ const store = @import("store.zig");
 const policy = @import("policy.zig");
 const goal_mod = @import("goal.zig");
 const run_mod = @import("run.zig");
+const observation_mod = @import("observation.zig");
 
 /// The trusted CTO kernel: task lifecycle, capability registry, event
 /// journal, and the approval boundary. Everything here is meant to stay
@@ -22,6 +23,7 @@ pub const Kernel = struct {
     tasks: std.ArrayList(task_mod.Task),
     goals: std.ArrayList(goal_mod.Goal),
     runs: std.ArrayList(run_mod.Run),
+    observations: std.ArrayList(observation_mod.Observation),
     next_task_id: u64 = 1,
     next_goal_id: u64 = 1,
     next_run_id: u64 = 1,
@@ -54,6 +56,9 @@ pub const Kernel = struct {
         var runs: std.ArrayList(run_mod.Run) = .empty;
         errdefer runs.deinit(allocator);
         try runs.appendSlice(allocator, try store.loadRuns(allocator, cto_root));
+        var observations: std.ArrayList(observation_mod.Observation) = .empty;
+        errdefer observations.deinit(allocator);
+        try observations.appendSlice(allocator, try store.loadObservations(allocator, cto_root));
 
         var next_task_id: u64 = 1;
         for (tasks.items) |task| {
@@ -76,6 +81,7 @@ pub const Kernel = struct {
             .tasks = tasks,
             .goals = goals,
             .runs = runs,
+            .observations = observations,
             .next_task_id = next_task_id,
             .next_goal_id = next_goal_id,
             .next_run_id = next_run_id,
@@ -86,6 +92,7 @@ pub const Kernel = struct {
         self.tasks.deinit(self.allocator);
         self.goals.deinit(self.allocator);
         self.runs.deinit(self.allocator);
+        self.observations.deinit(self.allocator);
         self.journal.deinit();
         self.capabilities.deinit();
     }
@@ -116,6 +123,37 @@ pub const Kernel = struct {
             return store.saveRuns(self.allocator, self.cto_root, self.runs.items);
         };
         return error.RunNotFound;
+    }
+
+    /// Records a normalized observation unless one with the same
+    /// (provider, delivery_id) is already stored. Returns `true` when this
+    /// call actually recorded it, `false` when it was a duplicate delivery
+    /// (still journaled either way, so a retried delivery is auditable).
+    ///
+    /// Takes ownership of `observation`'s heap-allocated fields: callers
+    /// must normalize with `self.allocator` and must not free the result
+    /// themselves, duplicate or not.
+    pub fn recordObservation(self: *Kernel, observation: observation_mod.Observation) !bool {
+        for (self.observations.items) |existing| {
+            if (std.mem.eql(u8, existing.provenance.provider, observation.provenance.provider) and
+                std.mem.eql(u8, existing.provenance.delivery_id, observation.provenance.delivery_id))
+            {
+                _ = try self.journal.append(
+                    .observation_duplicate,
+                    observation.provenance.provider,
+                    observation.provenance.delivery_id,
+                );
+                return false;
+            }
+        }
+        try self.observations.append(self.allocator, observation);
+        _ = try self.journal.append(
+            .observation_recorded,
+            observation.provenance.provider,
+            observation.provenance.delivery_id,
+        );
+        try store.appendObservation(self.allocator, self.cto_root, observation);
+        return true;
     }
 
     fn persistCapabilities(self: *Kernel) !void {
@@ -301,6 +339,52 @@ test "approve requires a candidate to be ready first" {
     try kernel.approve(task_id);
     try std.testing.expect(kernel.capabilities.isAvailable("github.pull_request.merged"));
     try std.testing.expectEqual(task_mod.TaskStatus.completed, kernel.findTask(task_id).?.status);
+}
+
+fn testObservation(alloc: std.mem.Allocator, delivery_id: []const u8) !observation_mod.Observation {
+    return .{
+        .occurred_at_ms = 1700000000000,
+        .provenance = .{
+            .provider = try alloc.dupe(u8, "github"),
+            .delivery_id = try alloc.dupe(u8, delivery_id),
+            .repository = try alloc.dupe(u8, "spacegauch0/fx"),
+            .url = try alloc.dupe(u8, "https://github.com/spacegauch0/fx/pull/1"),
+        },
+        .payload = .{ .pull_request_merged = .{
+            .number = 1,
+            .title = try alloc.dupe(u8, "CTO"),
+            .author = try alloc.dupe(u8, "diego"),
+            .merged_by = try alloc.dupe(u8, "reviewer"),
+            .head_sha = try alloc.dupe(u8, "abc"),
+            .base_branch = try alloc.dupe(u8, "main"),
+        } },
+    };
+}
+
+test "recordObservation deduplicates by provider and delivery id" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const cto_root = try std.fs.path.join(alloc, &.{ root, ".cto" });
+    var kernel = try Kernel.init(alloc, cto_root);
+
+    const first = try kernel.recordObservation(try testObservation(alloc, "delivery-1"));
+    try std.testing.expect(first);
+    try std.testing.expectEqual(@as(usize, 1), kernel.observations.items.len);
+
+    const duplicate = try kernel.recordObservation(try testObservation(alloc, "delivery-1"));
+    try std.testing.expect(!duplicate);
+    try std.testing.expectEqual(@as(usize, 1), kernel.observations.items.len);
+
+    const different = try kernel.recordObservation(try testObservation(alloc, "delivery-2"));
+    try std.testing.expect(different);
+    try std.testing.expectEqual(@as(usize, 2), kernel.observations.items.len);
+
+    const reloaded = try Kernel.init(alloc, cto_root);
+    try std.testing.expectEqual(@as(usize, 2), reloaded.observations.items.len);
 }
 
 test "kernel audits policy decisions and blocks escaped paths" {

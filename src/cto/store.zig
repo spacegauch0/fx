@@ -11,8 +11,10 @@ const task_mod = @import("task.zig");
 const event_mod = @import("event.zig");
 const goal_mod = @import("goal.zig");
 const run_mod = @import("run.zig");
+const observation_mod = @import("observation.zig");
 
 pub const events_file_name = "events.jsonl";
+pub const observations_file_name = "observations.jsonl";
 pub const capabilities_file_name = "capabilities.json";
 pub const tasks_file_name = "tasks.json";
 pub const goals_file_name = "goals.json";
@@ -358,6 +360,122 @@ pub fn appendEvent(alloc: std.mem.Allocator, cto_root_abs: []const u8, event: ev
         .detail = event.detail,
         .timestamp_ms = event.timestamp_ms,
     };
+    const line = try std.json.Stringify.valueAlloc(alloc, record, .{});
+    defer alloc.free(line);
+
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(alloc);
+    if (existing) |bytes| try buffer.appendSlice(alloc, bytes);
+    try buffer.appendSlice(alloc, line);
+    try buffer.append(alloc, '\n');
+
+    try io_mod.writeFileAtomic(alloc, path, buffer.items);
+}
+
+// -- observations.jsonl ------------------------------------------------
+
+/// Flat, single-variant-per-line record. `kind` selects which of the
+/// `pull_request_merged_*` fields are meaningful; a new observation kind
+/// gets its own optional field group here rather than a nested JSON
+/// object, matching how every other record in this file stays flat.
+const ObservationRecord = struct {
+    kind: []const u8,
+    occurred_at_ms: i64,
+    provenance_provider: []const u8,
+    provenance_delivery_id: []const u8,
+    provenance_repository: []const u8,
+    provenance_url: []const u8,
+    pull_request_merged_number: u64 = 0,
+    pull_request_merged_title: []const u8 = "",
+    pull_request_merged_author: []const u8 = "",
+    pull_request_merged_merged_by: []const u8 = "",
+    pull_request_merged_head_sha: []const u8 = "",
+    pull_request_merged_base_branch: []const u8 = "",
+};
+
+fn observationToRecord(observation: observation_mod.Observation) ObservationRecord {
+    var record = ObservationRecord{
+        .kind = @tagName(observation.kind()),
+        .occurred_at_ms = observation.occurred_at_ms,
+        .provenance_provider = observation.provenance.provider,
+        .provenance_delivery_id = observation.provenance.delivery_id,
+        .provenance_repository = observation.provenance.repository,
+        .provenance_url = observation.provenance.url,
+    };
+    switch (observation.payload) {
+        .pull_request_merged => |value| {
+            record.pull_request_merged_number = value.number;
+            record.pull_request_merged_title = value.title;
+            record.pull_request_merged_author = value.author;
+            record.pull_request_merged_merged_by = value.merged_by;
+            record.pull_request_merged_head_sha = value.head_sha;
+            record.pull_request_merged_base_branch = value.base_branch;
+        },
+    }
+    return record;
+}
+
+fn recordToObservation(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !?observation_mod.Observation {
+    const kind_str = jsonString(obj, "kind") orelse return null;
+    const kind = std.meta.stringToEnum(observation_mod.Kind, kind_str) orelse return null;
+    const provenance = observation_mod.Provenance{
+        .provider = try alloc.dupe(u8, jsonString(obj, "provenance_provider") orelse ""),
+        .delivery_id = try alloc.dupe(u8, jsonString(obj, "provenance_delivery_id") orelse ""),
+        .repository = try alloc.dupe(u8, jsonString(obj, "provenance_repository") orelse ""),
+        .url = try alloc.dupe(u8, jsonString(obj, "provenance_url") orelse ""),
+    };
+    const payload: @FieldType(observation_mod.Observation, "payload") = switch (kind) {
+        .pull_request_merged => .{ .pull_request_merged = .{
+            .number = @intCast(jsonInt(obj, "pull_request_merged_number") orelse 0),
+            .title = try alloc.dupe(u8, jsonString(obj, "pull_request_merged_title") orelse ""),
+            .author = try alloc.dupe(u8, jsonString(obj, "pull_request_merged_author") orelse ""),
+            .merged_by = try alloc.dupe(u8, jsonString(obj, "pull_request_merged_merged_by") orelse ""),
+            .head_sha = try alloc.dupe(u8, jsonString(obj, "pull_request_merged_head_sha") orelse ""),
+            .base_branch = try alloc.dupe(u8, jsonString(obj, "pull_request_merged_base_branch") orelse ""),
+        } },
+    };
+    return .{
+        .occurred_at_ms = jsonInt(obj, "occurred_at_ms") orelse 0,
+        .provenance = provenance,
+        .payload = payload,
+    };
+}
+
+pub fn loadObservations(alloc: std.mem.Allocator, cto_root_abs: []const u8) ![]observation_mod.Observation {
+    const path = try pathIn(alloc, cto_root_abs, observations_file_name);
+    defer alloc.free(path);
+    const bytes = try readFileIfExists(alloc, path) orelse return &.{};
+    defer alloc.free(bytes);
+
+    var observations: std.ArrayList(observation_mod.Observation) = .empty;
+    errdefer observations.deinit(alloc);
+
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    while (lines.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0) continue;
+        const parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => continue,
+        };
+        const observation = (try recordToObservation(alloc, obj)) orelse continue;
+        try observations.append(alloc, observation);
+    }
+    return observations.toOwnedSlice(alloc);
+}
+
+/// Appends one observation as a single JSON line. The caller is
+/// responsible for deduplicating by (provider, delivery_id) first —
+/// this function only ever appends.
+pub fn appendObservation(alloc: std.mem.Allocator, cto_root_abs: []const u8, observation: observation_mod.Observation) !void {
+    const path = try pathIn(alloc, cto_root_abs, observations_file_name);
+    defer alloc.free(path);
+    const existing = try readFileIfExists(alloc, path);
+    defer if (existing) |bytes| alloc.free(bytes);
+
+    const record = observationToRecord(observation);
     const line = try std.json.Stringify.valueAlloc(alloc, record, .{});
     defer alloc.free(line);
 

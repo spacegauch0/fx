@@ -8,6 +8,7 @@ const runtime_mod = @import("runtime.zig");
 const store = @import("store.zig");
 const task_mod = @import("task.zig");
 const channel = @import("channel.zig");
+const registry = @import("extensions/registry.zig");
 
 comptime {
     _ = @import("extension_contract.zig");
@@ -88,6 +89,13 @@ fn runInner(
         return 0;
     }
     if (std.mem.eql(u8, command, "channel")) return runChannel(&kernel, args);
+    if (std.mem.eql(u8, command, "observations")) {
+        printObservations(&kernel);
+        return 0;
+    }
+    if (std.mem.eql(u8, command, "ingest")) {
+        return runIngest(alloc, &kernel, args);
+    }
     if (std.mem.eql(u8, command, "events")) {
         printEvents(&kernel);
         return 0;
@@ -135,6 +143,67 @@ fn runReview(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const
         std.debug.print("{s}", .{diff});
     }
     return 0;
+}
+
+/// Feeds one raw provider event (JSON body on stdin) through every
+/// registered connector (`extensions/registry.zig`). A connector that
+/// returns an observation gets it recorded (deduplicated by
+/// provider+delivery id); nothing here trusts the event beyond that —
+/// there is no signature verification and no network I/O, so this is only
+/// as trustworthy as whatever fed it the body.
+fn runIngest(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
+    if (args.len < 3) {
+        std.debug.print("usage: fx cto ingest <event-name> <delivery-id> < body.json\n", .{});
+        return 1;
+    }
+    const event_name = args[1];
+    const delivery_id = args[2];
+    const body = readStdinAlloc(alloc, 4 * 1024 * 1024) catch |err| {
+        std.debug.print("fx cto ingest: could not read the event body from stdin: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+
+    if (registry.connectors.len == 0) {
+        std.debug.print("no connectors are registered yet\n", .{});
+        return 0;
+    }
+
+    var produced_observation = false;
+    inline for (registry.connectors) |connector| {
+        const maybe_observation = connector.normalize(alloc, .{
+            .event_name = event_name,
+            .delivery_id = delivery_id,
+            .body = body,
+        }) catch |err| {
+            std.debug.print(
+                "fx cto ingest: connector `{s}` rejected the event: {s}\n",
+                .{ connector.id, @errorName(err) },
+            );
+            return 1;
+        };
+        if (maybe_observation) |observation| {
+            produced_observation = true;
+            const recorded = try kernel.recordObservation(observation);
+            std.debug.print(
+                "connector `{s}` {s} an observation for `{s}`\n",
+                .{ connector.id, if (recorded) "recorded" else "saw a duplicate delivery of", connector.capability },
+            );
+        }
+    }
+    if (!produced_observation) {
+        std.debug.print(
+            "every registered connector ran but none produced an observation for this `{s}` event\n",
+            .{event_name},
+        );
+    }
+    return 0;
+}
+
+fn readStdinAlloc(alloc: std.mem.Allocator, max_bytes: usize) ![]u8 {
+    const io = io_mod.getIo();
+    var read_buf: [8192]u8 = undefined;
+    var reader = std.Io.File.stdin().reader(io, &read_buf);
+    return reader.interface.allocRemaining(alloc, std.Io.Limit.limited(max_bytes));
 }
 
 fn isHelp(command: []const u8) bool {
@@ -250,6 +319,8 @@ fn printHelp() void {
         \\  runs                      List worker execution attempts
         \\  decisions                 List durable policy decisions
         \\  channel "<command>"       Execute a normalized human-channel command
+        \\  ingest <event> <id>       Normalize a raw event body (stdin) via registered connectors
+        \\  observations              List recorded observations
         \\  review <task-id>          Show the candidate extension diff
         \\  approve <task-id>         Activate a candidate awaiting approval
         \\  events                    Show the append-only audit journal
@@ -319,6 +390,28 @@ fn printRuns(kernel: *kernel_mod.Kernel) void {
     }
     for (kernel.runs.items) |worker_run| {
         std.debug.print("#{d} task #{d} [{s}] {s}\n", .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker });
+    }
+}
+
+fn printObservations(kernel: *kernel_mod.Kernel) void {
+    if (kernel.observations.items.len == 0) {
+        std.debug.print("no observations yet\n", .{});
+        return;
+    }
+    for (kernel.observations.items) |observation| {
+        switch (observation.payload) {
+            .pull_request_merged => |value| std.debug.print(
+                "[{s}] {s}#{d} \"{s}\" merged by {s} ({s})\n",
+                .{
+                    observation.provenance.provider,
+                    observation.provenance.repository,
+                    value.number,
+                    value.title,
+                    value.merged_by,
+                    observation.provenance.delivery_id,
+                },
+            ),
+        }
     }
 }
 
