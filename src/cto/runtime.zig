@@ -131,6 +131,7 @@ pub const Runtime = struct {
             .worktree_path = worktree_path,
             .prompt = prompt,
         }) catch |err| {
+            try self.kernel.finishRun(run_id, false);
             const reason = try std.fmt.allocPrint(self.allocator, "worker crashed: {s}", .{@errorName(err)});
             defer self.allocator.free(reason);
             try self.kernel.markFailed(task_id, reason);
