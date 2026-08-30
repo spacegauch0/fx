@@ -11,6 +11,7 @@ const task_mod = @import("task.zig");
 comptime {
     _ = @import("extension_contract.zig");
     _ = @import("extensions/registry.zig");
+    _ = @import("channel.zig");
 }
 
 const default_cto_root = ".cto";
