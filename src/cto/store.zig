@@ -9,10 +9,14 @@ const io_mod = @import("../core/shared/io.zig");
 const capability_mod = @import("capability.zig");
 const task_mod = @import("task.zig");
 const event_mod = @import("event.zig");
+const goal_mod = @import("goal.zig");
+const run_mod = @import("run.zig");
 
 pub const events_file_name = "events.jsonl";
 pub const capabilities_file_name = "capabilities.json";
 pub const tasks_file_name = "tasks.json";
+pub const goals_file_name = "goals.json";
+pub const runs_file_name = "runs.json";
 pub const versions_dir_name = "versions";
 
 /// Resolves `input` (which may be relative, e.g. the default ".cto") to an
@@ -67,6 +71,77 @@ fn jsonBool(obj: std.json.ObjectMap, key: []const u8) ?bool {
         .bool => |b| b,
         else => null,
     };
+}
+
+// -- goals.json and runs.json -------------------------------------------
+
+pub fn loadGoals(alloc: std.mem.Allocator, cto_root_abs: []const u8) ![]goal_mod.Goal {
+    const path = try pathIn(alloc, cto_root_abs, goals_file_name);
+    defer alloc.free(path);
+    const bytes = try readFileIfExists(alloc, path) orelse return &.{};
+    defer alloc.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const items = switch (parsed.value) {
+        .array => |value| value.items,
+        else => return &.{},
+    };
+    var goals: std.ArrayList(goal_mod.Goal) = .empty;
+    errdefer goals.deinit(alloc);
+    for (items) |item| {
+        const obj = switch (item) {
+            .object => |value| value,
+            else => continue,
+        };
+        const id = jsonInt(obj, "id") orelse continue;
+        const objective = jsonString(obj, "objective") orelse continue;
+        const status = std.meta.stringToEnum(goal_mod.Status, jsonString(obj, "status") orelse "active") orelse .active;
+        try goals.append(alloc, .{ .id = @intCast(id), .objective = try alloc.dupe(u8, objective), .status = status, .created_at_ms = jsonInt(obj, "created_at_ms") orelse 0 });
+    }
+    return goals.toOwnedSlice(alloc);
+}
+
+pub fn saveGoals(alloc: std.mem.Allocator, cto_root_abs: []const u8, goals: []const goal_mod.Goal) !void {
+    const path = try pathIn(alloc, cto_root_abs, goals_file_name);
+    defer alloc.free(path);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, goals, .{ .whitespace = .indent_2 });
+    defer alloc.free(bytes);
+    try io_mod.writeFileAtomic(alloc, path, bytes);
+}
+
+pub fn loadRuns(alloc: std.mem.Allocator, cto_root_abs: []const u8) ![]run_mod.Run {
+    const path = try pathIn(alloc, cto_root_abs, runs_file_name);
+    defer alloc.free(path);
+    const bytes = try readFileIfExists(alloc, path) orelse return &.{};
+    defer alloc.free(bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    const items = switch (parsed.value) {
+        .array => |value| value.items,
+        else => return &.{},
+    };
+    var runs: std.ArrayList(run_mod.Run) = .empty;
+    errdefer runs.deinit(alloc);
+    for (items) |item| {
+        const obj = switch (item) {
+            .object => |value| value,
+            else => continue,
+        };
+        const id = jsonInt(obj, "id") orelse continue;
+        const task_id = jsonInt(obj, "task_id") orelse continue;
+        const worker = jsonString(obj, "worker") orelse continue;
+        const status = std.meta.stringToEnum(run_mod.Status, jsonString(obj, "status") orelse "started") orelse .started;
+        try runs.append(alloc, .{ .id = @intCast(id), .task_id = @intCast(task_id), .worker = try alloc.dupe(u8, worker), .status = status, .started_at_ms = jsonInt(obj, "started_at_ms") orelse 0, .finished_at_ms = jsonInt(obj, "finished_at_ms") });
+    }
+    return runs.toOwnedSlice(alloc);
+}
+
+pub fn saveRuns(alloc: std.mem.Allocator, cto_root_abs: []const u8, runs: []const run_mod.Run) !void {
+    const path = try pathIn(alloc, cto_root_abs, runs_file_name);
+    defer alloc.free(path);
+    const bytes = try std.json.Stringify.valueAlloc(alloc, runs, .{ .whitespace = .indent_2 });
+    defer alloc.free(bytes);
+    try io_mod.writeFileAtomic(alloc, path, bytes);
 }
 
 // -- capabilities.json -------------------------------------------------

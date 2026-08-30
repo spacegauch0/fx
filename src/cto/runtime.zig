@@ -47,6 +47,7 @@ pub const Runtime = struct {
 
     pub fn request(self: *Runtime, objective: []const u8) !?u64 {
         _ = try self.kernel.journal.append(.human_requested, "human", objective);
+        _ = try self.kernel.createGoal(objective);
 
         if (requiresGithubMergeAwareness(objective) and
             !self.kernel.capabilities.isAvailable("github.pull_request.merged"))
@@ -121,6 +122,7 @@ pub const Runtime = struct {
         defer self.allocator.free(prompt);
 
         _ = try self.kernel.journal.append(.worker_started, "cto-dev", "fx");
+        const run_id = try self.kernel.startRun(task_id, "fx");
 
         var adapter = self.fx_worker.asWorker();
         const result = adapter.run(self.allocator, .{
@@ -136,9 +138,12 @@ pub const Runtime = struct {
         };
 
         if (!result.success) {
+            try self.kernel.finishRun(run_id, false);
             try self.kernel.markFailed(task_id, result.summary);
             return;
         }
+
+        try self.kernel.finishRun(run_id, true);
 
         _ = try self.kernel.journal.append(.worker_completed, "cto-dev", result.summary);
 
@@ -215,7 +220,7 @@ test "request returns null and does not create a task when nothing is missing" {
     const task_id = try runtime.request("refactor the billing service");
     try std.testing.expect(task_id == null);
     try std.testing.expectEqual(@as(usize, 0), kernel.tasks.items.len);
-    try std.testing.expectEqual(@as(usize, 1), kernel.journal.events.items.len);
+    try std.testing.expectEqual(@as(usize, 2), kernel.journal.events.items.len);
 }
 
 test "request records a failed task rather than crashing when the worktree cannot be created" {

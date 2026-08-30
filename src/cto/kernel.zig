@@ -7,6 +7,8 @@ const journal_mod = @import("journal.zig");
 const task_mod = @import("task.zig");
 const store = @import("store.zig");
 const policy = @import("policy.zig");
+const goal_mod = @import("goal.zig");
+const run_mod = @import("run.zig");
 
 /// The trusted CTO kernel: task lifecycle, capability registry, event
 /// journal, and the approval boundary. Everything here is meant to stay
@@ -18,7 +20,11 @@ pub const Kernel = struct {
     capabilities: capability_mod.Registry,
     journal: journal_mod.Journal,
     tasks: std.ArrayList(task_mod.Task),
+    goals: std.ArrayList(goal_mod.Goal),
+    runs: std.ArrayList(run_mod.Run),
     next_task_id: u64 = 1,
+    next_goal_id: u64 = 1,
+    next_run_id: u64 = 1,
 
     /// `cto_root` may be relative (the default is ".cto"); it is resolved
     /// to an absolute path once, up front, since every durable write below
@@ -42,10 +48,24 @@ pub const Kernel = struct {
         errdefer tasks.deinit(allocator);
         const loaded_tasks = try store.loadTasks(allocator, cto_root);
         try tasks.appendSlice(allocator, loaded_tasks);
+        var goals: std.ArrayList(goal_mod.Goal) = .empty;
+        errdefer goals.deinit(allocator);
+        try goals.appendSlice(allocator, try store.loadGoals(allocator, cto_root));
+        var runs: std.ArrayList(run_mod.Run) = .empty;
+        errdefer runs.deinit(allocator);
+        try runs.appendSlice(allocator, try store.loadRuns(allocator, cto_root));
 
         var next_task_id: u64 = 1;
         for (tasks.items) |task| {
             if (task.id >= next_task_id) next_task_id = task.id + 1;
+        }
+        var next_goal_id: u64 = 1;
+        for (goals.items) |goal| {
+            if (goal.id >= next_goal_id) next_goal_id = goal.id + 1;
+        }
+        var next_run_id: u64 = 1;
+        for (runs.items) |run| {
+            if (run.id >= next_run_id) next_run_id = run.id + 1;
         }
 
         return .{
@@ -54,14 +74,48 @@ pub const Kernel = struct {
             .capabilities = capabilities,
             .journal = journal,
             .tasks = tasks,
+            .goals = goals,
+            .runs = runs,
             .next_task_id = next_task_id,
+            .next_goal_id = next_goal_id,
+            .next_run_id = next_run_id,
         };
     }
 
     pub fn deinit(self: *Kernel) void {
         self.tasks.deinit(self.allocator);
+        self.goals.deinit(self.allocator);
+        self.runs.deinit(self.allocator);
         self.journal.deinit();
         self.capabilities.deinit();
+    }
+
+    pub fn createGoal(self: *Kernel, objective: []const u8) !u64 {
+        const id = self.next_goal_id;
+        self.next_goal_id += 1;
+        try self.goals.append(self.allocator, .{ .id = id, .objective = try self.allocator.dupe(u8, objective), .created_at_ms = io_mod.milliTimestamp() });
+        _ = try self.journal.append(.goal_created, "goal", objective);
+        try store.saveGoals(self.allocator, self.cto_root, self.goals.items);
+        return id;
+    }
+
+    pub fn startRun(self: *Kernel, task_id: u64, worker: []const u8) !u64 {
+        const id = self.next_run_id;
+        self.next_run_id += 1;
+        try self.runs.append(self.allocator, .{ .id = id, .task_id = task_id, .worker = try self.allocator.dupe(u8, worker), .started_at_ms = io_mod.milliTimestamp() });
+        _ = try self.journal.append(.run_started, worker, "worker run started");
+        try store.saveRuns(self.allocator, self.cto_root, self.runs.items);
+        return id;
+    }
+
+    pub fn finishRun(self: *Kernel, run_id: u64, succeeded: bool) !void {
+        for (self.runs.items) |*run| if (run.id == run_id) {
+            run.status = if (succeeded) .succeeded else .failed;
+            run.finished_at_ms = io_mod.milliTimestamp();
+            _ = try self.journal.append(.run_finished, run.worker, if (succeeded) "succeeded" else "failed");
+            return store.saveRuns(self.allocator, self.cto_root, self.runs.items);
+        };
+        return error.RunNotFound;
     }
 
     fn persistCapabilities(self: *Kernel) !void {
