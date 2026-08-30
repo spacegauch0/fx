@@ -6,6 +6,7 @@ const event_mod = @import("event.zig");
 const journal_mod = @import("journal.zig");
 const task_mod = @import("task.zig");
 const store = @import("store.zig");
+const policy = @import("policy.zig");
 
 /// The trusted CTO kernel: task lifecycle, capability registry, event
 /// journal, and the approval boundary. Everything here is meant to stay
@@ -99,6 +100,20 @@ pub const Kernel = struct {
         task.status = .delegated;
         _ = try self.journal.append(.task_delegated, task.required_capability, task.assignee);
         try self.persistTasks();
+    }
+
+    /// Audit and enforce a policy decision before an effect is dispatched.
+    /// `deny` is returned as an error so callers cannot accidentally ignore it.
+    pub fn authorize(self: *Kernel, action: []const u8, path: ?[]const u8) !policy.Decision {
+        const decision = policy.classify(action, path);
+        const kind: event_mod.EventKind = switch (decision) {
+            .allow => .policy_allowed,
+            .approval_required => .policy_approval_required,
+            .deny => .policy_denied,
+        };
+        _ = try self.journal.append(kind, action, path orelse "");
+        if (decision == .deny) return error.PolicyDenied;
+        return decision;
     }
 
     /// Records that a worker attempt failed. The task and its worktree (if
@@ -232,6 +247,20 @@ test "approve requires a candidate to be ready first" {
     try kernel.approve(task_id);
     try std.testing.expect(kernel.capabilities.isAvailable("github.pull_request.merged"));
     try std.testing.expectEqual(task_mod.TaskStatus.completed, kernel.findTask(task_id).?.status);
+}
+
+test "kernel audits policy decisions and blocks escaped paths" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const cto_root = try std.fs.path.join(alloc, &.{ root, ".cto" });
+    var kernel = try Kernel.init(alloc, cto_root);
+    try std.testing.expectEqual(policy.Decision.allow, try kernel.authorize("worker.run", "src/cto/extensions/a.zig"));
+    try std.testing.expectError(error.PolicyDenied, kernel.authorize("filesystem.write", "../escape"));
+    try std.testing.expectEqual(event_mod.EventKind.policy_denied, kernel.journal.events.items[1].kind);
 }
 
 test "kernel state survives across process-like re-initialization" {

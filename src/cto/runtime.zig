@@ -70,6 +70,14 @@ pub const Runtime = struct {
     }
 
     fn delegateSelfExtension(self: *Runtime, task_id: u64) !void {
+        const decision = self.kernel.authorize("worker.run", "src/cto/extensions/") catch |err| {
+            try self.kernel.markFailed(task_id, @errorName(err));
+            return;
+        };
+        if (decision != .allow) {
+            try self.kernel.markFailed(task_id, "worker dispatch requires human approval");
+            return;
+        }
         try self.kernel.markDelegated(task_id);
 
         const worktree_path = try self.workspace.worktreePath(task_id);

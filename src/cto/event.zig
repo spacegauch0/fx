@@ -15,6 +15,12 @@ pub const EventKind = enum {
     approval_requested,
     approval_granted,
     approval_rejected,
+    goal_created,
+    policy_allowed,
+    policy_approval_required,
+    policy_denied,
+    run_started,
+    run_finished,
 };
 
 pub const Event = struct {
