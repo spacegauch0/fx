@@ -73,6 +73,14 @@ fn runInner(
         printTasks(&kernel);
         return 0;
     }
+    if (std.mem.eql(u8, command, "goals")) {
+        printGoals(&kernel);
+        return 0;
+    }
+    if (std.mem.eql(u8, command, "runs")) {
+        printRuns(&kernel);
+        return 0;
+    }
     if (std.mem.eql(u8, command, "events")) {
         printEvents(&kernel);
         return 0;
@@ -201,6 +209,8 @@ fn printHelp() void {
         \\  capabilities              List every known capability and its status
         \\  request "<objective>"     Ask CTO to pursue an outcome
         \\  tasks                     List tasks and their lifecycle status
+        \\  goals                     List durable outcome goals
+        \\  runs                      List worker execution attempts
         \\  review <task-id>          Show the candidate extension diff
         \\  approve <task-id>         Activate a candidate awaiting approval
         \\  events                    Show the append-only audit journal
@@ -250,6 +260,26 @@ fn printTasks(kernel: *kernel_mod.Kernel) void {
             "#{d} [{s}] {s} -> {s}\n",
             .{ task.id, @tagName(task.status), task.required_capability, task.assignee },
         );
+    }
+}
+
+fn printGoals(kernel: *kernel_mod.Kernel) void {
+    if (kernel.goals.items.len == 0) {
+        std.debug.print("no goals yet\n", .{});
+        return;
+    }
+    for (kernel.goals.items) |goal| {
+        std.debug.print("#{d} [{s}] {s}\n", .{ goal.id, @tagName(goal.status), goal.objective });
+    }
+}
+
+fn printRuns(kernel: *kernel_mod.Kernel) void {
+    if (kernel.runs.items.len == 0) {
+        std.debug.print("no runs yet\n", .{});
+        return;
+    }
+    for (kernel.runs.items) |worker_run| {
+        std.debug.print("#{d} task #{d} [{s}] {s}\n", .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker });
     }
 }
 
