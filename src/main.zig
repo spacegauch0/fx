@@ -3145,8 +3145,8 @@ fn runCtoFxWorker(
         alloc,
         &.{ "--yolo", "--no-save", prompt_z },
         ask_cfg,
-        default_context_registry,
-        builtin_tools.advertisement_set,
+        surface_cfg.context_registry,
+        surface_cfg.tool_set,
     );
 
     try std.process.setCurrentPath(io_mod.getIo(), original_cwd);
