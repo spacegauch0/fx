@@ -152,6 +152,7 @@ const transcript_runtime = @import("ui/transcript/runtime.zig");
 const resume_projection = @import("ui/transcript/resume_projection.zig");
 const assistant_pacer = @import("ui/assistant/pacer.zig");
 const approval_prompt = @import("core/permissions/approval_prompt.zig");
+const cto_main = @import("cto/main.zig");
 
 const Allocator = std.mem.Allocator;
 const Layout = types.Layout;
@@ -3085,6 +3086,15 @@ fn mainC(c_argc: c_int, c_argv: [*][*:0]c_char, c_envp: [*:null]?[*:0]c_char) !v
 
     var cli_arg_buf: [64][:0]const u8 = undefined;
     const cli_args = if (raw_args.len <= 1) &.{} else try cliArgsFromRaw(raw_args, &cli_arg_buf);
+    // The CTO layer is intercepted here, before any interactive/TUI runtime
+    // boots: it is a separate composition root on top of the fx harness,
+    // not a mode of the App struct below. See src/cto/main.zig. It gets the
+    // real environment block (not just processAllocator()) because it
+    // spawns git/zig subprocesses whose PATH resolution must match the
+    // invoking shell's, not some default search path.
+    if (cli_args.len > 0 and std.mem.eql(u8, cli_args[0], "cto")) {
+        exitFast(cto_main.run(processAllocator(), cli_args[1..], environBlockFromRaw(raw_env)));
+    }
     if (command_runner.isForegroundSessionInvocation(cli_args)) {
         io_mod.setRawEnviron(raw_env);
         const process_args = argsFromRaw(raw_args);
