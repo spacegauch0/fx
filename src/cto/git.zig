@@ -44,7 +44,16 @@ pub fn termExitedZero(term: std.process.Child.Term) bool {
 /// Returns a caller-owned diff for the self-generated extension boundary.
 /// Intent-to-add makes new untracked connector files visible in the diff
 /// without staging their contents or creating a commit.
+///
+/// Returns an empty diff, rather than erroring, when the worktree has no
+/// `src/cto/extensions/` directory at all: `git add -N` requires the
+/// pathspec to match something on disk, and a dry-run or otherwise
+/// unchanged candidate never creates that directory.
 pub fn extensionDiff(alloc: std.mem.Allocator, worktree_path: []const u8) ![]u8 {
+    const extensions_path = try std.fs.path.join(alloc, &.{ worktree_path, "src", "cto", "extensions" });
+    defer alloc.free(extensions_path);
+    if (!try dirExists(extensions_path)) return alloc.alloc(u8, 0);
+
     try runOk(alloc, &.{
         "git", "-C", worktree_path, "add", "-N", "--", "src/cto/extensions",
     });
@@ -59,6 +68,15 @@ pub fn extensionDiff(alloc: std.mem.Allocator, worktree_path: []const u8) ![]u8 
         return error.GitDiffFailed;
     }
     return result.stdout;
+}
+
+fn dirExists(path: []const u8) !bool {
+    var dir = std.Io.Dir.openDirAbsolute(io_mod.getIo(), path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return false,
+        else => return err,
+    };
+    dir.close(io_mod.getIo());
+    return true;
 }
 
 fn runOk(alloc: std.mem.Allocator, argv: []const []const u8) !void {
@@ -122,6 +140,27 @@ test "extensionDiff includes a new untracked connector" {
     defer alloc.free(diff);
     try std.testing.expect(std.mem.find(u8, diff, "github_events.zig") != null);
     try std.testing.expect(std.mem.find(u8, diff, "+pub const id = \"github\";") != null);
+}
+
+test "extensionDiff returns empty rather than erroring when extensions/ was never created" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    defer alloc.free(root);
+    try runGitOrSkip(alloc, &.{ "git", "-C", root, "init", "--quiet" });
+    try runGitOrSkip(alloc, &.{ "git", "-C", root, "config", "user.email", "cto@example.com" });
+    try runGitOrSkip(alloc, &.{ "git", "-C", root, "config", "user.name", "cto" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "README.md", .data = "seed\n" });
+    try runGitOrSkip(alloc, &.{ "git", "-C", root, "add", "README.md" });
+    try runGitOrSkip(alloc, &.{ "git", "-C", root, "commit", "--quiet", "-m", "seed" });
+
+    // No src/cto/extensions/ directory anywhere in this worktree: this is
+    // the common case for a dry-run task (fx cto review must not crash).
+    const diff = try extensionDiff(alloc, root);
+    defer alloc.free(diff);
+    try std.testing.expectEqual(@as(usize, 0), diff.len);
 }
 
 fn runGitOrSkip(alloc: std.mem.Allocator, argv: []const []const u8) !void {
