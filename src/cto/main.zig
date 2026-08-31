@@ -14,6 +14,7 @@ const secrets = @import("secrets.zig");
 const process_worker = @import("process_worker.zig");
 const views = @import("views.zig");
 const id_mod = @import("id.zig");
+const schema_mod = @import("schema.zig");
 const control_protocol = @import("control_protocol.zig");
 const control_client = @import("control_client.zig");
 const daemon_mod = @import("daemon.zig");
@@ -72,6 +73,10 @@ fn runInner(
 
     if (std.mem.eql(u8, command, "daemon")) return runDaemon(alloc, cto_root, repository_path, args);
     if (std.mem.eql(u8, command, "ctl")) return runCtl(alloc, cto_root, args);
+    if (std.mem.eql(u8, command, "schema")) {
+        try withStderr(schema_mod.render, .{});
+        return 0;
+    }
 
     // D4: when a daemon owns this workspace, every command it understands
     // is proxied to it rather than read (or worse, written) directly —
@@ -762,6 +767,7 @@ fn printHelp() void {
         \\  events [--since N]        Show the append-only audit journal (optionally only what's new)
         \\  daemon [--once]           Run the local control-plane daemon (foreground)
         \\  ctl '<json>'              Send one versioned control-protocol request
+        \\  schema                    Machine-readable description of every entity/event kind
         \\
     , .{});
 }
