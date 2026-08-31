@@ -19,11 +19,11 @@ current shape is wrong, the plan changes it rather than working around it.
 | 1. Durable observations, delivery dedup, merge timestamps | Done |
 | 1. Project memory (facts, decisions, outcomes) | Outstanding |
 | 2. GitHub ingestion service — signature verification | Done (M2) |
-| 2. GitHub ingestion service — listener / polling | M6 |
+| 2. GitHub ingestion service — listener / polling | Outstanding |
 | 3. Planning and supervision | Done (M4) |
 | 4. Version activation and rollback | Done (M3) |
 | — Agent-native interfaces (brief/explain/schema/`--json`) | M5 |
-| 5. Long-running control plane | M6 |
+| 5. Long-running control plane | Done (M6) |
 | 6. Telegram transport | M7 |
 | 7. Proactive loop | M8 |
 
@@ -485,28 +485,92 @@ to decide its next action without reading any `.cto/*.json` file or any
 `src/cto/*.zig` source directly. (Same criterion as D7 — this milestone
 exists to satisfy it.)
 
-### M6 — Daemon and control plane
+### M6 — Daemon and control plane — **done** (webhook/polling ingestion outstanding)
 
-- `fx cto daemon` — foreground, supervised-friendly, structured logs.
-- Single-writer lock per D4.
-- Unix control socket per D2, speaking newline-delimited JSON —
-  deserializing directly into the `Command` schema M5 established (D8).
-- Loopback webhook endpoint (opt-in) and the polling alternative
-  (default).
-- `/health` and `/ready`.
-- CLI auto-detects a running daemon and proxies to it.
-- `ProcessWorker` (M4) becomes the default dispatch path. This needs one
-  small, honestly-scoped change: `Runtime` today holds a concrete
-  `FxWorker`, not the type-erased `worker.Worker` it could hold instead —
-  widen that field so the CLI's composition root keeps constructing an
-  `FxWorker`/`LiveRunner`-backed `Worker` (unchanged) while the daemon
-  constructs a `ProcessWorker`-backed one. Same seam D3 already
-  describes, sized to fit the second implementation M4 already built for
-  it.
+- `src/cto/action.zig`: the canonical `Action` enum D8 called for, landed
+  here rather than waiting on the rest of M5 — the daemon needed *some*
+  shared vocabulary to avoid becoming a third independent one, and
+  building it once, correctly, was cheaper than building it twice. The
+  broader D8 merge (folding `channel.Command`'s own text-parser fully
+  into this vocabulary) is still outstanding; today the two coexist,
+  each honest about its scope (`channel.Command` — free text a human
+  types; `action.Action` — every command any transport can issue).
+- `src/cto/writer_lock.zig`: D4's single-writer lock, built on
+  `io_mod.openOrCreateVerifiedPrivateDirFromDir` +
+  `io_mod.acquireTimedAdvisoryLock` (already hardened, already tested) —
+  not new locking code. Held by the daemon for its whole lifetime; taken
+  by the CLI only for the duration of one mutating command when no
+  daemon is running.
+- `src/cto/control_protocol.zig`: a versioned (`protocol_version`),
+  newline-delimited JSON request/response envelope. `Command` is every
+  `Action` plus two protocol-only liveness probes (`health`, `ready`)
+  that never touch the kernel; `Command.toAction()` is `inline else`
+  over `@field`, so the two enums are mechanically guaranteed to agree —
+  adding to one without the other is a compile error, not a place to
+  drift.
+- `src/cto/daemon.zig` / `control_client.zig`: the Unix-socket server and
+  client. One finding worth recording since it would otherwise resurface
+  as a confusing production bug: the socket does **not** live inside
+  `.cto/`. `sockaddr_un.sun_path` is capped at 108 bytes on Linux
+  (`std.Io.net.UnixAddress.max_len`), and a project checked out several
+  directories deep — ordinary for a CI runner or a sandboxed dev
+  environment, and exactly what this repository's own working directory
+  looked like while building this milestone — blows that budget before
+  any filename is even appended. The socket instead lives at
+  `$XDG_RUNTIME_DIR/fx-cto/<hash>.sock` (falling back to
+  `~/.cache/fx/cto/<hash>.sock`), matching D2's original design; the
+  directory is force-set to `0700` and the failure to do so is a hard
+  daemon-startup error, never silently swallowed, since D2's whole
+  authentication argument depends on it.
+- Reads (`status`/`tasks`/`goals`/…) are rendered by `src/cto/views.zig`,
+  extracted from what were `main.zig`'s private, stderr-only printers.
+  The daemon and the CLI now render the *same* functions into two
+  destinations (a socket response buffer vs. stderr) instead of keeping
+  two independently-formatted copies of "what does `tasks` look like" —
+  a smaller instance of D9's structured-result principle, delivered here
+  ahead of the rest of D9.
+- `request`/`approve`/`activate`/`rollback`/`interrupt`/`review` are
+  handled directly against the kernel/runtime (not proxied text
+  commands); `ingest` (needs stdin) and `channel` (its own free-text
+  syntax and D5 refusal logic) stay CLI/direct-mode only, by design, and
+  the CLI never attempts to proxy them.
+- `request` over the control socket dispatches through `Runtime.
+  initWithWorker`, a new constructor that injects a `ProcessWorker` (M4)
+  as the live worker — the change D3 always said the daemon would need,
+  landed as an *addition* (`worker_override: ?worker_mod.Worker`)
+  rather than a rewrite of `Runtime.init`, so the CLI's existing
+  `FxWorker`/`LiveRunner` composition root is untouched and every
+  existing test and call site keeps working exactly as before.
+- The CLI auto-detects a running daemon (`control_client.daemonAvailable`,
+  a `health` probe) and proxies every command that has an `Action`
+  counterpart to it; `ingest`/`channel` stay direct always. With no
+  daemon detected, a mutating command acquires the writer lock itself
+  for its own duration; a second writer — whether another direct
+  invocation or an attempt to start a second daemon — is refused with
+  `error.LockBusy` rather than racing whole-file JSON state.
+- Verified against the real compiled binary, not just unit tests (this
+  project's established bar): a background daemon answering `ctl`
+  health/status/request/interrupt calls, the direct CLI transparently
+  proxying to it, a killed daemon's stale socket file and lock both
+  cleaning up correctly on the next daemon start, and a direct-mode
+  command succeeding again once the daemon is gone.
 
-*Done when:* the daemon survives terminal exit, a second writer is
-refused rather than corrupting state, and every existing `fx cto`
-command works identically with and without a daemon running.
+**Known gap, honestly scoped out:** the loopback webhook endpoint and
+the default polling loop (this milestone's other original half) are not
+built. Ingestion still only has its M2 half — a trusted admission
+function `fx cto ingest` calls locally — with nothing that fetches or
+receives an event on its own yet. That's real, separable, network-facing
+work; folding it into whichever later milestone actually needs low-
+latency ingestion is preferable to landing it here disconnected from any
+consumer of it.
+
+*Done when (control plane only — see the gap above):* the daemon
+survives terminal exit, a second writer is refused rather than
+corrupting state, and every existing `fx cto` command works identically
+with and without a daemon running. Verified for every read command,
+`request`, and `interrupt`; `approve`/`activate`/`rollback`/`review` are
+implemented the same way but not yet independently smoke-tested end to
+end over the socket.
 
 ### M7 — Telegram transport
 

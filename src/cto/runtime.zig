@@ -25,6 +25,13 @@ pub const Runtime = struct {
     counterpart: counterpart_mod.Counterpart,
     workspace: workspace_mod.Workspace,
     fx_worker: fx_worker_mod.FxWorker,
+    /// Set by `initWithWorker`; when present, dispatch uses this worker
+    /// instead of `fx_worker`. This is how the daemon (M6) injects
+    /// `ProcessWorker` (M4) as the live dispatch mechanism without
+    /// disturbing the CLI's `FxWorker`/`LiveRunner` composition-root seam
+    /// (D3) at all: the CLI never sets this field, so `init` below is
+    /// unchanged and every existing caller is unaffected.
+    worker_override: ?worker_mod.Worker = null,
 
     /// `repository_path` must already be absolute; the worktree paths this
     /// runtime hands to the worker are joined against it verbatim.
@@ -44,6 +51,26 @@ pub const Runtime = struct {
             .counterpart = counterpart_mod.Counterpart.ctoDev(repository_path),
             .workspace = workspace_mod.Workspace.init(allocator, repository_path, kernel.cto_root),
             .fx_worker = .{ .dispatch = dispatch, .live_runner = live_runner },
+        };
+    }
+
+    /// Daemon constructor (M6): the daemon supervises workers
+    /// out-of-process (`ProcessWorker`, M4) rather than in-process, per
+    /// D3. `fx_worker` is left at its harmless `dry_run`/no-runner default
+    /// and never consulted — `worker_override` always wins when set.
+    pub fn initWithWorker(
+        allocator: std.mem.Allocator,
+        kernel: *kernel_mod.Kernel,
+        repository_path: []const u8,
+        worker: worker_mod.Worker,
+    ) Runtime {
+        return .{
+            .allocator = allocator,
+            .kernel = kernel,
+            .counterpart = counterpart_mod.Counterpart.ctoDev(repository_path),
+            .workspace = workspace_mod.Workspace.init(allocator, repository_path, kernel.cto_root),
+            .fx_worker = .{ .dispatch = .dry_run, .live_runner = null },
+            .worker_override = worker,
         };
     }
 
@@ -187,7 +214,8 @@ pub const Runtime = struct {
             _ = try self.kernel.journal.append(.worker_started, "cto-dev", detail);
 
             const run_id = try self.kernel.startRun(task_id, "fx");
-            var adapter = self.fx_worker.asWorker();
+            const fallback = self.fx_worker.asWorker();
+            var adapter = self.worker_override orelse fallback;
             const attempt_result = adapter.run(self.allocator, .{
                 .task_id = task_id,
                 .run_id = run_id,

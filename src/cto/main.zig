@@ -11,8 +11,12 @@ const channel = @import("channel.zig");
 const registry = @import("extensions/registry.zig");
 const ingest_auth = @import("ingest_auth.zig");
 const secrets = @import("secrets.zig");
-const release_mod = @import("release.zig");
 const process_worker = @import("process_worker.zig");
+const views = @import("views.zig");
+const control_protocol = @import("control_protocol.zig");
+const control_client = @import("control_client.zig");
+const daemon_mod = @import("daemon.zig");
+const writer_lock = @import("writer_lock.zig");
 
 comptime {
     _ = @import("extension_contract.zig");
@@ -65,11 +69,35 @@ fn runInner(
     }
     const command = args[0];
 
+    if (std.mem.eql(u8, command, "daemon")) return runDaemon(alloc, cto_root, repository_path, args);
+    if (std.mem.eql(u8, command, "ctl")) return runCtl(alloc, cto_root, args);
+
+    // D4: when a daemon owns this workspace, every command it understands
+    // is proxied to it rather than read (or worse, written) directly —
+    // `channel` and `ingest` are the two exceptions (stdin and free-text
+    // sub-syntax the daemon doesn't parse) and stay direct-mode always.
+    if (shouldProxyToDaemon(command) and control_client.daemonAvailable(alloc, cto_root)) {
+        return proxyToDaemon(alloc, cto_root, args);
+    }
+
+    var writer_guard: ?writer_lock.Guard = null;
+    if (isMutatingCommand(command)) {
+        writer_guard = writer_lock.acquire(alloc, cto_root, 250) catch |err| {
+            std.debug.print(
+                "fx cto: could not acquire the workspace writer lock ({s}); " ++
+                    "a daemon may already own {s}\n",
+                .{ @errorName(err), cto_root },
+            );
+            return 1;
+        };
+    }
+    defer if (writer_guard) |*guard| guard.release();
+
     var kernel = try kernel_mod.Kernel.init(alloc, cto_root);
     defer kernel.deinit();
 
     if (std.mem.eql(u8, command, "status")) {
-        printStatus(&kernel);
+        try printStatus(&kernel);
         return 0;
     }
     if (std.mem.eql(u8, command, "capabilities")) {
@@ -77,32 +105,32 @@ fn runInner(
         return 0;
     }
     if (std.mem.eql(u8, command, "tasks")) {
-        printTasks(&kernel);
+        try printTasks(&kernel);
         return 0;
     }
     if (std.mem.eql(u8, command, "goals")) {
-        printGoals(&kernel);
+        try printGoals(&kernel);
         return 0;
     }
     if (std.mem.eql(u8, command, "runs")) {
-        printRuns(&kernel);
+        try printRuns(&kernel);
         return 0;
     }
     if (std.mem.eql(u8, command, "decisions")) {
-        printDecisions(&kernel);
+        try printDecisions(&kernel);
         return 0;
     }
     if (std.mem.eql(u8, command, "channel")) return runChannel(alloc, &kernel, args);
     if (std.mem.eql(u8, command, "interrupt")) return runInterrupt(alloc, &kernel, args);
     if (std.mem.eql(u8, command, "observations")) {
-        printObservations(&kernel);
+        try printObservations(&kernel);
         return 0;
     }
     if (std.mem.eql(u8, command, "ingest")) {
         return runIngest(alloc, &kernel, args);
     }
     if (std.mem.eql(u8, command, "events")) {
-        printEvents(&kernel);
+        try printEvents(&kernel);
         return 0;
     }
     if (std.mem.eql(u8, command, "request")) {
@@ -128,6 +156,89 @@ fn runInner(
     std.debug.print("fx cto: unknown command `{s}`\n\n", .{command});
     printHelp();
     return 1;
+}
+
+fn isMutatingCommand(command: []const u8) bool {
+    return std.mem.eql(u8, command, "request") or
+        std.mem.eql(u8, command, "approve") or
+        std.mem.eql(u8, command, "activate") or
+        std.mem.eql(u8, command, "rollback") or
+        std.mem.eql(u8, command, "interrupt") or
+        std.mem.eql(u8, command, "ingest") or
+        std.mem.eql(u8, command, "channel");
+}
+
+/// `ingest` (reads a body from stdin) and `channel` (a free-text
+/// sub-syntax the daemon doesn't parse, with its own D5 refusal logic)
+/// stay direct-mode always. Everything else proxies when a daemon is
+/// running, and only if it actually has a `control_protocol.Command`
+/// counterpart — a typo'd command falls through to the normal
+/// "unknown command" message instead of a confusing proxy attempt.
+fn shouldProxyToDaemon(command: []const u8) bool {
+    if (std.mem.eql(u8, command, "ingest") or std.mem.eql(u8, command, "channel")) return false;
+    return std.meta.stringToEnum(control_protocol.Command, command) != null;
+}
+
+fn proxyToDaemon(alloc: std.mem.Allocator, cto_root: []const u8, args: []const [:0]const u8) !u8 {
+    const command = std.meta.stringToEnum(control_protocol.Command, args[0]) orelse return 1;
+    const argument: ?[]const u8 = if (args.len > 1) args[1] else null;
+    const request_id = try std.fmt.allocPrint(alloc, "cli-{d}", .{io_mod.milliTimestamp()});
+    const response = control_client.send(alloc, cto_root, .{
+        .id = request_id,
+        .command = command,
+        .argument = argument,
+    }) catch |err| {
+        std.debug.print("fx cto: daemon request failed: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer response.deinit();
+    if (response.value.output.len > 0) std.debug.print("{s}", .{response.value.output});
+    if (response.value.error_message) |message| std.debug.print("fx cto: {s}\n", .{message});
+    return response.value.exit_code;
+}
+
+fn runDaemon(
+    alloc: std.mem.Allocator,
+    cto_root: []const u8,
+    repository_path: []const u8,
+    args: []const [:0]const u8,
+) !u8 {
+    const exe = try std.process.executablePathAlloc(io_mod.getIo(), alloc);
+    defer alloc.free(exe);
+    const absolute_repository_path = try store.resolveAbsolute(alloc, repository_path);
+    daemon_mod.run(alloc, .{
+        .cto_root = cto_root,
+        .repository_path = absolute_repository_path,
+        .fx_binary_path = exe,
+        .once = args.len > 1 and std.mem.eql(u8, args[1], "--once"),
+    }) catch |err| {
+        std.debug.print("fx cto daemon: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    return 0;
+}
+
+fn runCtl(alloc: std.mem.Allocator, cto_root: []const u8, args: []const [:0]const u8) !u8 {
+    if (args.len < 2) {
+        std.debug.print(
+            "usage: fx cto ctl '{{\"id\":\"1\",\"command\":\"status\"}}'\n",
+            .{},
+        );
+        return 1;
+    }
+    const parsed = control_protocol.decodeRequest(alloc, args[1]) catch |err| {
+        std.debug.print("fx cto ctl: invalid request: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer parsed.deinit();
+    const response = control_client.send(alloc, cto_root, parsed.value) catch |err| {
+        std.debug.print("fx cto ctl: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    defer response.deinit();
+    if (response.value.output.len > 0) std.debug.print("{s}", .{response.value.output});
+    if (response.value.error_message) |message| std.debug.print("fx cto: {s}\n", .{message});
+    return response.value.exit_code;
 }
 
 fn runReview(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
@@ -418,10 +529,10 @@ fn runChannel(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []cons
         return 1;
     }
     switch (channel.parse(args[1])) {
-        .status => printStatus(kernel),
-        .goals => printGoals(kernel),
-        .runs => printRuns(kernel),
-        .decisions => printDecisions(kernel),
+        .status => try printStatus(kernel),
+        .goals => try printGoals(kernel),
+        .runs => try printRuns(kernel),
+        .decisions => try printDecisions(kernel),
         .approve => |id| {
             // Decision D5 (docs/CTO_ROADMAP.md): approving a self-modifying
             // candidate activates new code, and this bridge is designed to
@@ -515,150 +626,56 @@ fn printHelp() void {
         \\  rollback                  Point the active release at the previous version
         \\  interrupt <run-id>        Cancel an out-of-process worker run
         \\  events                    Show the append-only audit journal
+        \\  daemon [--once]           Run the local control-plane daemon (foreground)
+        \\  ctl '<json>'              Send one versioned control-protocol request
         \\
     , .{});
 }
 
-fn printStatus(kernel: *kernel_mod.Kernel) void {
-    const counts = kernel.capabilities.count();
-    var pending: usize = 0;
-    for (kernel.tasks.items) |task| {
-        switch (task.status) {
-            .completed, .rejected, .failed => {},
-            else => pending += 1,
-        }
-    }
-    std.debug.print(
-        \\CTO runtime: ready
-        \\counterpart: cto-dev
-        \\worker: fx
-        \\capabilities: {d} available, {d} missing
-        \\pending tasks: {d}
-        \\
-    ,
-        .{ counts.available, counts.missing, pending },
-    );
+/// Renders `views.zig`'s output to stderr — the CLI's half of the
+/// "one rendering, two destinations" split; `daemon.zig` renders the same
+/// functions into a socket response buffer instead.
+fn printStatus(kernel: *kernel_mod.Kernel) !void {
+    try withStderr(views.renderStatus, .{kernel});
 }
 
 fn printCapabilities(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel) !void {
-    const entries = try kernel.capabilities.sortedEntries(alloc);
-    defer alloc.free(entries);
-    for (entries) |capability| {
-        std.debug.print(
-            "{s}: {s} ({s})\n",
-            .{ capability.name, @tagName(capability.status), capability.source },
-        );
-    }
+    try withStderr(views.renderCapabilities, .{ alloc, kernel });
 }
 
-fn printTasks(kernel: *kernel_mod.Kernel) void {
-    if (kernel.tasks.items.len == 0) {
-        std.debug.print("no tasks yet\n", .{});
-        return;
-    }
-    for (kernel.tasks.items) |task| {
-        std.debug.print(
-            "#{d} [{s}] {s} -> {s}\n",
-            .{ task.id, @tagName(task.status), task.required_capability, task.assignee },
-        );
-    }
+fn printTasks(kernel: *kernel_mod.Kernel) !void {
+    try withStderr(views.renderTasks, .{kernel});
 }
 
-fn printGoals(kernel: *kernel_mod.Kernel) void {
-    if (kernel.goals.items.len == 0) {
-        std.debug.print("no goals yet\n", .{});
-        return;
-    }
-    for (kernel.goals.items) |goal| {
-        std.debug.print("#{d} [{s}] {s}\n", .{ goal.id, @tagName(goal.status), goal.objective });
-    }
+fn printGoals(kernel: *kernel_mod.Kernel) !void {
+    try withStderr(views.renderGoals, .{kernel});
 }
 
-fn printRuns(kernel: *kernel_mod.Kernel) void {
-    if (kernel.runs.items.len == 0) {
-        std.debug.print("no runs yet\n", .{});
-        return;
-    }
-    for (kernel.runs.items) |worker_run| {
-        if (worker_run.finished_reason) |reason| {
-            std.debug.print(
-                "#{d} task #{d} [{s}] {s} ({s})\n",
-                .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker, reason },
-            );
-        } else {
-            std.debug.print("#{d} task #{d} [{s}] {s}\n", .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker });
-        }
-    }
+fn printRuns(kernel: *kernel_mod.Kernel) !void {
+    try withStderr(views.renderRuns, .{kernel});
 }
 
 fn printReleases(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel) !void {
-    if (kernel.releases.items.len == 0) {
-        std.debug.print("no releases yet\n", .{});
-        return;
-    }
-    // The symlink, not the metadata file, decides which release is live.
-    const current = try release_mod.readCurrent(alloc, kernel.cto_root);
-    defer if (current) |value| alloc.free(value);
-
-    for (kernel.releases.items) |release| {
-        const active = if (current) |value| std.mem.eql(u8, value, release.path) else false;
-        std.debug.print("v{d}{s} task #{d} {s} {s}\n", .{
-            release.version,
-            if (active) " (active)" else "",
-            release.task_id,
-            release.capability,
-            release.commit,
-        });
-    }
+    try withStderr(views.renderReleases, .{ alloc, kernel });
 }
 
-fn printObservations(kernel: *kernel_mod.Kernel) void {
-    if (kernel.observations.items.len == 0) {
-        std.debug.print("no observations yet\n", .{});
-        return;
-    }
-    for (kernel.observations.items) |observation| {
-        switch (observation.payload) {
-            .pull_request_merged => |value| std.debug.print(
-                "[{s}] {s}#{d} \"{s}\" merged by {s} ({s})\n",
-                .{
-                    observation.provenance.provider,
-                    observation.provenance.repository,
-                    value.number,
-                    value.title,
-                    value.merged_by,
-                    observation.provenance.delivery_id,
-                },
-            ),
-        }
-    }
+fn printObservations(kernel: *kernel_mod.Kernel) !void {
+    try withStderr(views.renderObservations, .{kernel});
 }
 
-fn printDecisions(kernel: *kernel_mod.Kernel) void {
-    var found = false;
-    for (kernel.journal.events.items) |event| {
-        switch (event.kind) {
-            .policy_allowed, .policy_approval_required, .policy_denied => {
-                found = true;
-                std.debug.print("#{d} [{s}] {s} {s}\n", .{ event.sequence, @tagName(event.kind), event.subject, event.detail });
-            },
-            else => {},
-        }
-    }
-    if (!found) std.debug.print("no policy decisions yet\n", .{});
+fn printDecisions(kernel: *kernel_mod.Kernel) !void {
+    try withStderr(views.renderDecisions, .{kernel});
 }
 
-fn printEvents(kernel: *kernel_mod.Kernel) void {
-    if (kernel.journal.events.items.len == 0) {
-        std.debug.print("no events yet\n", .{});
-        return;
-    }
-    for (kernel.journal.events.items) |event| {
-        std.debug.print(
-            "{d} {s} {s}: {s}\n",
-            .{ event.sequence, @tagName(event.kind), event.subject, event.detail },
-        );
-    }
+fn printEvents(kernel: *kernel_mod.Kernel) !void {
+    try withStderr(views.renderEvents, .{kernel});
+}
+
+fn withStderr(comptime renderFn: anytype, args: anytype) !void {
+    var buf: [4096]u8 = undefined;
+    var file_writer = std.Io.File.stderr().writer(io_mod.getIo(), &buf);
+    try @call(.auto, renderFn, .{&file_writer.interface} ++ args);
+    try file_writer.interface.flush();
 }
 
 test "printHelp does not require a kernel and always succeeds" {
