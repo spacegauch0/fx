@@ -214,28 +214,24 @@ no-op today (worker cancellation isn't implemented).
 
 ## Known limitations / what's next
 
-- **Read output is nine independent hand-formatted views, not one
-  situational surface.** `status`/`tasks`/`goals`/`runs`/`releases`/
-  `events`/`observations` each show a fragment; there is no single call
-  that says "here's what's happening and what needs you," no
-  cross-referenced drill-down into one task/run's full story, no `--json`,
-  and ids are four independently-numbered `u64` counters displayed as
-  bare `#7` — a task id and a run id can and do collide numerically. This
-  is real friction for exactly the kind of operator this system is built
-  for (an agent driving it, not a human eyeballing a terminal); see
-  `docs/CTO_ROADMAP.md`'s "Agent-operating model" and D7–D9 for the
-  planned fix (`brief`, `explain`, `schema`, prefixed ids, `--json`) —
-  roadmap milestone M5, ordered before the daemon precisely so the rest
-  of this project's own development benefits from it too.
-- **No webhook receiver, no Telegram transport, no daemon.** `fx cto
-  ingest` and `fx cto channel` are the trusted-side halves of ingestion
-  and human control; nothing here listens on a socket, verifies a webhook
-  signature, or authenticates a Telegram chat. A long-running process that
-  does that — plus an authenticated local API, retries/timeouts/deadlines
-  for workers, `/interrupt` actually cancelling a run, and durable
-  project-memory beyond raw observations — is real, security-sensitive
-  infrastructure work that's deliberately not in this PoC. See
-  `docs/SPEC.md` for the fuller roadmap this PR was scoped against.
+- **`--json` doesn't exist yet.** `fx cto brief`, `fx cto explain
+  <kind>-<id>`, and `fx cto schema` (D7) now give a single-call
+  situational summary, a cross-referenced causal story per entity, and a
+  reflection-generated description of every entity/event kind — closing
+  most of the friction this bullet used to describe. What remains is D9:
+  every command still only produces `std.debug.print` text, with no typed
+  result value, no JSON envelope, and no `next_actions` as structured
+  data (though `brief`/`explain` already print the equivalent as
+  copy-pasteable "next:" suggestions). See `docs/CTO_ROADMAP.md` M5.
+- **No webhook receiver, no Telegram transport.** `fx cto daemon` (M6)
+  now provides a real control plane — a Unix-socket protocol
+  (`fx cto ctl`), a single-writer lock, and out-of-process worker
+  dispatch with real cancellation (`fx cto interrupt`, M4) — but nothing
+  listens for a GitHub webhook or polls for one, and nothing speaks to
+  Telegram. `fx cto ingest` and `fx cto channel` remain the trusted-side
+  halves of ingestion and human control, waiting for a transport in
+  front of them. See `docs/SPEC.md` for the fuller roadmap this PR was
+  scoped against.
 - **The GitHub connector was authored directly, not generated live.** This
   PoC has no model credentials to actually drive `fx cto request` through
   a live worker run, so `github_events.zig` is a reviewed, hand-written

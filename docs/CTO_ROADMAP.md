@@ -22,7 +22,7 @@ current shape is wrong, the plan changes it rather than working around it.
 | 2. GitHub ingestion service — listener / polling | Outstanding |
 | 3. Planning and supervision | Done (M4) |
 | 4. Version activation and rollback | Done (M3) |
-| — Agent-native interfaces (brief/explain/schema/`--json`) | M5 |
+| — Agent-native interfaces (brief/explain/schema; `--json` outstanding) | Mostly done (M5) |
 | 5. Long-running control plane | Done (M6) |
 | 6. Telegram transport | M7 |
 | 7. Proactive loop | M8 |
@@ -450,40 +450,69 @@ order — matches this project's own precedent of catching the real bugs
 (the `FileNotFound`, the empty release commit) only once the *real*
 binary was exercised, not just unit tests.
 
-### M5 — Agent-native interfaces
+### M5 — Agent-native interfaces — **mostly done** (`--json`/D9 and the full D8 merge outstanding)
 
-Implements D7, D8, and D9. Pure CLI-side legibility work — no daemon
-required, nothing here is blocked on M6 — and deliberately ordered
-*before* the daemon rather than after, for two reasons: it directly
-improves the efficiency of every session that builds M6–M8 (this is the
-same system its own future development leans on), and the daemon's
-control socket is specified to speak newline-delimited JSON — landing
-the `Command` schema and the `--json` envelope first means the socket
-protocol is "reuse what already exists," not "invent a third wire
-format under time pressure."
+Implements D7, most of D8, and a slice of D9. Pure CLI-side legibility
+work — landed independently of M6, and, as it turned out, threaded
+through it: the daemon's own read commands are `views.zig`'s renderers
+called a second way, and `action.Action` (D8) is what let the daemon add
+a transport without adding a third independent command vocabulary.
 
-- `fx cto brief`, `fx cto explain <kind>-<id>`, `fx cto logs <run-id>`
-  (D7).
-- Prefixed ids (`task-N`/`run-N`/`release-N`/`goal-N`) displayed
-  everywhere; accepted everywhere, with `interrupt`/`logs` requiring the
-  `run-` prefix specifically (D7).
-- `--since <sequence>` on `events`/`observations` (D7).
-- `fx cto schema`: machine-readable description of every entity and
-  event kind, generated from the same types `store.zig` already defines
-  — not hand-maintained prose that can drift from the code.
-- `--json` on every read command, plus the structured-result-first
-  refactor and `next_actions` it depends on (D9).
-- `channel.Command` extended to cover the full action surface and
-  adopted by the CLI parser as its only implementation of "what this
-  system can be asked to do" (D8).
-- `request`'s idempotency fix (filed under D9).
-- `zig build test-cto`, scoped to `src/cto/**`.
+Delivered:
+
+- `fx cto brief` — one call, the whole current situation: missing
+  capabilities, tasks needing a decision (each with the exact next
+  command to run), runs in flight with elapsed time, and the last few
+  failures.
+- `fx cto explain <kind>-<id>` — the full causal narrative for one task,
+  run, release, or goal. For a task: every run it produced (via
+  `Run.task_id`, exact), its releases, and journal entries matching its
+  capability name — documented in the view itself as a best-effort
+  correlation, not a guaranteed one, since `Event.subject` was never
+  given a task-id field to filter on precisely.
+- `fx cto logs <run-id> [--tail N]` — reads `.cto/runs/<id>.log` (M4)
+  directly.
+- `fx cto schema` — a JSON description of every entity's fields and every
+  event/action kind, generated via `@typeInfo` reflection over the real
+  types, not hand-maintained prose.
+- Prefixed ids (`task-N`/`run-N`/`release-N`/`goal-N`), displayed
+  everywhere and accepted everywhere; `interrupt` and `logs` require the
+  `run-` prefix specifically (`id.parseStrict`), since those are exactly
+  where a task id and a run id are both plausible. `id.parseAny` lets
+  `explain` determine an argument's kind from its own prefix, since it is
+  the one command that can legitimately mean any of the four kinds.
+- `--since <sequence>` on `events`. **Not** on `observations` as
+  originally scoped: `Observation` has no sequence field to filter on
+  (only the journal does), and inventing one purely for this felt like
+  the wrong direction versus giving `events` a real cursor first, which
+  is the one that actually gets checked on every agent check-in.
+- `request`'s idempotency fix (`Kernel.inFlightTaskForCapability`).
+- `zig build test-cto`, scoped to `src/cto/**` — ~3.5s instead of several
+  minutes, and it already caught a real test-isolation bug in the M6
+  daemon work within the same session it was built (see git history).
+- `action.Action` (D8): the canonical vocabulary, shared today by the CLI
+  parser and the daemon's control socket. `channel.zig`'s own text parser
+  (`/status`, `/approve <id>`, …) is a second, narrower, still-separate
+  parser over a subset of the same actions — the full D8 merge (folding
+  `channel.Command` into `action.Action` so there is exactly one type,
+  not two that happen to agree today) is still outstanding.
+
+Outstanding:
+
+- **`--json` and the structured-result-first refactor (D9).** Every
+  command still only produces `std.debug.print` text; there is no typed
+  result value, no JSON envelope, and no `next_actions` as data (though
+  `brief`/`explain` already print the equivalent as prose — "next:"
+  sections with copy-pasteable commands). This is the largest remaining
+  piece of the original M5 scope and the reason this milestone is
+  "mostly," not fully, done.
+- **The full D8 merge** described above.
 
 *Done when:* a fresh agent session with no prior context can run `fx cto
 schema` once and `fx cto brief` per check-in and have enough information
 to decide its next action without reading any `.cto/*.json` file or any
-`src/cto/*.zig` source directly. (Same criterion as D7 — this milestone
-exists to satisfy it.)
+`src/cto/*.zig` source directly. Met for the text CLI; not yet
+demonstrated for a caller that specifically needs `--json`.
 
 ### M6 — Daemon and control plane — **done** (webhook/polling ingestion outstanding)
 
