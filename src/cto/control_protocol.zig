@@ -25,6 +25,8 @@ pub const Command = enum {
     rollback,
     interrupt,
     ingest,
+    brief,
+    explain,
 
     pub fn toAction(self: Command) ?action_mod.Action {
         return switch (self) {

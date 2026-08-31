@@ -63,6 +63,26 @@ pub fn parseStrict(kind: Kind, text: []const u8) ?u64 {
     return std.fmt.parseInt(u64, text[dash + 1 ..], 10) catch null;
 }
 
+pub const Parsed = struct { kind: Kind, id: u64 };
+
+/// Parses the exact `<kind>-<id>` form without an expected kind in
+/// advance — the prefix itself says which kind it is. Used by `fx cto
+/// explain <kind>-<id>`, the one command that can legitimately mean any
+/// of the four entity kinds, so unlike `parse`/`parseStrict` there is no
+/// single expected `Kind` to check the prefix against.
+pub fn parseAny(text: []const u8) ?Parsed {
+    const dash = std.mem.indexOfScalar(u8, text, '-') orelse return null;
+    const prefix_text = text[0..dash];
+    inline for (@typeInfo(Kind).@"enum".fields) |field| {
+        const kind: Kind = @enumFromInt(field.value);
+        if (std.mem.eql(u8, prefix_text, kind.prefix())) {
+            const id = std.fmt.parseInt(u64, text[dash + 1 ..], 10) catch return null;
+            return .{ .kind = kind, .id = id };
+        }
+    }
+    return null;
+}
+
 test "format produces the canonical prefixed form" {
     const alloc = std.testing.allocator;
     const text = try format(alloc, .task, 7);
@@ -92,4 +112,14 @@ test "parseStrict refuses a bare integer, unlike parse" {
     try std.testing.expectEqual(@as(?u64, null), parseStrict(.run, "12"));
     try std.testing.expectEqual(@as(?u64, 12), parseStrict(.run, "run-12"));
     try std.testing.expectEqual(@as(?u64, null), parseStrict(.run, "task-12"));
+}
+
+test "parseAny determines the kind from the prefix itself" {
+    try std.testing.expectEqual(Parsed{ .kind = .task, .id = 3 }, parseAny("task-3"));
+    try std.testing.expectEqual(Parsed{ .kind = .run, .id = 12 }, parseAny("run-12"));
+    try std.testing.expectEqual(Parsed{ .kind = .release, .id = 1 }, parseAny("release-1"));
+    try std.testing.expectEqual(Parsed{ .kind = .goal, .id = 2 }, parseAny("goal-2"));
+    try std.testing.expectEqual(@as(?Parsed, null), parseAny("3"));
+    try std.testing.expectEqual(@as(?Parsed, null), parseAny("bogus-3"));
+    try std.testing.expectEqual(@as(?Parsed, null), parseAny("task-notanumber"));
 }

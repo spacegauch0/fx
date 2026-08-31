@@ -139,6 +139,7 @@ fn execute(alloc: std.mem.Allocator, config: Config, request: control_protocol.R
         .interrupt => return executeInterrupt(alloc, &kernel, request.argument),
         .review => return executeReview(alloc, &kernel, request.argument),
         .events => return executeEvents(alloc, &kernel, request.argument),
+        .explain => return executeExplain(alloc, &kernel, request.argument),
         else => return executeReadView(alloc, &kernel, request.command),
     }
 }
@@ -264,6 +265,7 @@ fn executeReadView(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, command
         .decisions => try views.renderDecisions(&accumulating.writer, kernel),
         .observations => try views.renderObservations(&accumulating.writer, kernel),
         .releases => try views.renderReleases(&accumulating.writer, alloc, kernel),
+        .brief => try views.renderBrief(&accumulating.writer, alloc, kernel),
         else => unreachable, // every remaining Command variant is handled in execute() before reaching here
     }
     return .{ .exit_code = 0, .text = try alloc.dupe(u8, accumulating.writer.buffered()) };
@@ -280,6 +282,18 @@ fn executeEvents(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, argument:
     var accumulating = std.Io.Writer.Allocating.init(alloc);
     defer accumulating.deinit();
     try views.renderEvents(&accumulating.writer, kernel, since);
+    return .{ .exit_code = 0, .text = try alloc.dupe(u8, accumulating.writer.buffered()) };
+}
+
+fn executeExplain(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, argument: ?[]const u8) !Outcome {
+    const text = argument orelse return .{ .exit_code = 2, .text = "explain requires an id (task-3, run-12, release-1, or goal-2)\n" };
+    const parsed = id_mod.parseAny(text) orelse return .{
+        .exit_code = 2,
+        .text = "invalid id — expected `<kind>-<id>` (task-3, run-12, release-1, or goal-2)\n",
+    };
+    var accumulating = std.Io.Writer.Allocating.init(alloc);
+    defer accumulating.deinit();
+    try views.renderExplain(&accumulating.writer, kernel, parsed.kind, parsed.id);
     return .{ .exit_code = 0, .text = try alloc.dupe(u8, accumulating.writer.buffered()) };
 }
 

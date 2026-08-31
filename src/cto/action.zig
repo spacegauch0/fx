@@ -33,6 +33,8 @@ pub const Action = enum {
     rollback,
     interrupt,
     ingest,
+    brief,
+    explain,
 
     /// Actions that mutate `.cto/` state and therefore need the writer
     /// lock (D4) when no daemon owns it, and are refused rather than
@@ -40,7 +42,7 @@ pub const Action = enum {
     pub fn isMutating(self: Action) bool {
         return switch (self) {
             .request, .approve, .activate, .rollback, .interrupt, .ingest => true,
-            .status, .capabilities, .tasks, .goals, .runs, .decisions, .observations, .events, .releases, .review => false,
+            .status, .capabilities, .tasks, .goals, .runs, .decisions, .observations, .events, .releases, .review, .brief, .explain => false,
         };
     }
 };

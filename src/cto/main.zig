@@ -101,6 +101,11 @@ fn runInner(
         try printStatus(&kernel);
         return 0;
     }
+    if (std.mem.eql(u8, command, "brief")) {
+        try printBrief(alloc, &kernel);
+        return 0;
+    }
+    if (std.mem.eql(u8, command, "explain")) return runExplain(&kernel, args);
     if (std.mem.eql(u8, command, "capabilities")) {
         try printCapabilities(alloc, &kernel);
         return 0;
@@ -572,6 +577,22 @@ fn runChannel(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []cons
     return 0;
 }
 
+fn runExplain(kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
+    if (args.len < 2) {
+        std.debug.print("usage: fx cto explain <kind>-<id>  (e.g. task-3, run-12, release-1, goal-2)\n", .{});
+        return 1;
+    }
+    const parsed = id_mod.parseAny(args[1]) orelse {
+        std.debug.print(
+            "fx cto explain: `{s}` is not a valid id — expected `<kind>-<id>` (task-3, run-12, release-1, or goal-2)\n",
+            .{args[1]},
+        );
+        return 1;
+    };
+    try withStderr(views.renderExplain, .{ kernel, parsed.kind, parsed.id });
+    return 0;
+}
+
 fn runInterrupt(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
     if (args.len < 2) {
         std.debug.print("usage: fx cto interrupt <run-id>\n", .{});
@@ -720,6 +741,8 @@ fn printHelp() void {
         \\
         \\Commands:
         \\  status                    Show kernel, worker, and capability summary
+        \\  brief                     One-call situational summary: what needs you, what's running, what failed
+        \\  explain <kind>-<id>       Full causal story for one task/run/release/goal
         \\  capabilities              List every known capability and its status
         \\  request "<objective>"     Ask CTO to pursue an outcome
         \\  tasks                     List tasks and their lifecycle status
@@ -748,6 +771,10 @@ fn printHelp() void {
 /// functions into a socket response buffer instead.
 fn printStatus(kernel: *kernel_mod.Kernel) !void {
     try withStderr(views.renderStatus, .{kernel});
+}
+
+fn printBrief(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel) !void {
+    try withStderr(views.renderBrief, .{ alloc, kernel });
 }
 
 fn printCapabilities(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel) !void {
