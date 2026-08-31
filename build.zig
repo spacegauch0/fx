@@ -90,6 +90,24 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_exe_tests.step);
 
+    // A standalone root scoped to src/cto/**: `io.zig` (its only real
+    // dependency outside src/cto/) imports nothing beyond std/builtin/a
+    // small platform helper, so this compiles a small fraction of the
+    // ~8600-test full suite and returns in seconds, not minutes. Iterating
+    // on the CTO runtime should not require validating the UI, session
+    // store, or command runner on every change to catch a scoped mistake.
+    const cto_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/cto_test_root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_cto_tests = b.addRunArtifact(cto_tests);
+    const test_cto_step = b.step("test-cto", "Run only src/cto/** tests (fast)");
+    test_cto_step.dependOn(&run_cto_tests.step);
+
     if (wasm_surface != .none) {
         addWasmArtifact(b, wasm_surface, git_commit, app_version, update_channel);
     }

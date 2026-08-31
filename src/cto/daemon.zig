@@ -273,12 +273,45 @@ fn writeResponse(stream: *std.Io.net.Stream, alloc: std.mem.Allocator, response:
 /// its own, before any socket filename is even appended. A short,
 /// XDG-standard rendezvous directory keeps the path budget spent on
 /// something that doesn't grow with the workspace's location.
-fn socketDir(alloc: std.mem.Allocator) ![]u8 {
-    if (io_mod.getenv("XDG_RUNTIME_DIR")) |dir| {
+///
+/// Pure given its inputs, unlike a version that calls `io_mod.getenv`
+/// directly: `io_mod`'s environ is process-global mutable state that only
+/// a real `cto_main.run()` invocation populates (via `setEnvironBlock`),
+/// so a function that read it internally could not be unit-tested without
+/// either depending on test execution order or reaching into another
+/// module's private state. `socketDir`/`socketPath` below resolve the
+/// environment once, at the real entry points, and pass it in.
+fn socketDirFor(alloc: std.mem.Allocator, xdg_runtime_dir: ?[]const u8, home: ?[]const u8) ![]u8 {
+    if (xdg_runtime_dir) |dir| {
         if (dir.len > 0) return std.fs.path.join(alloc, &.{ dir, "fx-cto" });
     }
-    const home = io_mod.getenv("HOME") orelse return error.NoHomeDirectory;
-    return std.fs.path.join(alloc, &.{ home, ".cache", "fx", "cto" });
+    const resolved_home = home orelse return error.NoHomeDirectory;
+    return std.fs.path.join(alloc, &.{ resolved_home, ".cache", "fx", "cto" });
+}
+
+fn socketDir(alloc: std.mem.Allocator) ![]u8 {
+    return socketDirFor(alloc, io_mod.getenv("XDG_RUNTIME_DIR"), io_mod.getenv("HOME"));
+}
+
+fn socketPathFor(
+    alloc: std.mem.Allocator,
+    cto_root: []const u8,
+    xdg_runtime_dir: ?[]const u8,
+    home: ?[]const u8,
+) ![]u8 {
+    const root = try store.resolveAbsolute(alloc, cto_root);
+    defer alloc.free(root);
+
+    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(root, &digest, .{});
+    var hex_buf: [16]u8 = undefined;
+    const hash_hex = hexPrefix(&hex_buf, digest[0..8]);
+
+    const dir = try socketDirFor(alloc, xdg_runtime_dir, home);
+    defer alloc.free(dir);
+    var name_buf: [24]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "{s}.sock", .{hash_hex});
+    return std.fs.path.join(alloc, &.{ dir, name });
 }
 
 /// Absolute path to the control socket for a given `.cto` root. Shared by
@@ -288,19 +321,7 @@ fn socketDir(alloc: std.mem.Allocator) ![]u8 {
 /// root rather than something workspace-path-shaped, keeping the whole
 /// path both short and unique per workspace.
 pub fn socketPath(alloc: std.mem.Allocator, cto_root: []const u8) ![]u8 {
-    const root = try store.resolveAbsolute(alloc, cto_root);
-    defer alloc.free(root);
-
-    var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(root, &digest, .{});
-    var hex_buf: [16]u8 = undefined;
-    const hash_hex = hexPrefix(&hex_buf, digest[0..8]);
-
-    const dir = try socketDir(alloc);
-    defer alloc.free(dir);
-    var name_buf: [24]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buf, "{s}.sock", .{hash_hex});
-    return std.fs.path.join(alloc, &.{ dir, name });
+    return socketPathFor(alloc, cto_root, io_mod.getenv("XDG_RUNTIME_DIR"), io_mod.getenv("HOME"));
 }
 
 /// Creates `socketDir()` if needed and forces it to `0700`: D2's whole
@@ -332,6 +353,13 @@ fn hexPrefix(buf: []u8, bytes: []const u8) []const u8 {
 }
 
 test "socketPath is stable, short, and distinct per workspace" {
+    // Exercises the pure `socketPathFor` directly with synthetic
+    // XDG_RUNTIME_DIR/HOME values rather than depending on `io_mod.getenv`,
+    // whose backing state is only populated by a real `cto_main.run()`
+    // invocation (or by a test that explicitly sets it up, as the
+    // real-socket test below does) — a plain unit test must not depend on
+    // that having happened already, which is a question of *test
+    // execution order*, not of anything this function does.
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -342,21 +370,39 @@ test "socketPath is stable, short, and distinct per workspace" {
     const other_cto_root = try std.fs.path.join(alloc, &.{ root, "elsewhere", ".cto" });
     defer alloc.free(other_cto_root);
 
-    const first = try socketPath(alloc, cto_root);
+    const first = try socketPathFor(alloc, cto_root, null, "/synthetic/home");
     defer alloc.free(first);
-    const second = try socketPath(alloc, cto_root);
+    const second = try socketPathFor(alloc, cto_root, null, "/synthetic/home");
     defer alloc.free(second);
     try std.testing.expectEqualStrings(first, second);
     try std.testing.expect(first.len <= std.Io.net.UnixAddress.max_len);
     try std.testing.expect(std.mem.endsWith(u8, first, ".sock"));
     try std.testing.expect(std.mem.indexOf(u8, first, "/.cto/") == null);
 
-    const other = try socketPath(alloc, other_cto_root);
+    const other = try socketPathFor(alloc, other_cto_root, null, "/synthetic/home");
     defer alloc.free(other);
     try std.testing.expect(!std.mem.eql(u8, first, other));
+
+    try std.testing.expectError(error.NoHomeDirectory, socketPathFor(alloc, cto_root, null, null));
+
+    const with_runtime_dir = try socketPathFor(alloc, cto_root, "/run/user/1000", "/synthetic/home");
+    defer alloc.free(with_runtime_dir);
+    try std.testing.expect(std.mem.startsWith(u8, with_runtime_dir, "/run/user/1000/fx-cto/"));
 }
 
 test "the daemon answers a health probe over the real socket and releases its lock on exit" {
+    // `run()` resolves the real socket directory via `io_mod.getenv`,
+    // which — unlike `socketPathFor` above — is production code and
+    // rightly depends on it. That backing state is process-global and
+    // only a real `cto_main.run()` invocation populates it, so this test
+    // populates it itself with the real environment rather than relying
+    // on some other test file having already done so as a side effect
+    // (which is what let this exact test pass under `zig build test`'s
+    // full suite while failing under the new, smaller `test-cto` binary
+    // — a real, if quiet, test-isolation bug this milestone's own faster
+    // build step caught).
+    io_mod.setRawEnviron(std.c.environ);
+
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

@@ -442,6 +442,26 @@ pub const Kernel = struct {
         }
         return null;
     }
+
+    /// Returns an existing task for `capability` that has not reached a
+    /// terminal outcome (`completed`/`rejected`/`failed`), if one exists.
+    /// `Runtime.request` uses this so a defensively re-issued request —
+    /// exactly what a context compaction or a retried tool call produces —
+    /// finds the task already in flight instead of forking a second,
+    /// parallel one that duplicates real worker/build compute. A `failed`
+    /// task is deliberately treated as terminal here even though nothing
+    /// retries it automatically: the human's next move is a fresh
+    /// `request`, not being silently pointed back at a dead end.
+    pub fn inFlightTaskForCapability(self: *Kernel, capability: []const u8) ?*task_mod.Task {
+        for (self.tasks.items) |*task| {
+            if (!std.mem.eql(u8, task.required_capability, capability)) continue;
+            switch (task.status) {
+                .completed, .rejected, .failed => continue,
+                else => return task,
+            }
+        }
+        return null;
+    }
 };
 
 test "createCapabilityTask assigns cto-dev and records a task_created event" {

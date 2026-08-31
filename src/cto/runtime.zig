@@ -81,6 +81,20 @@ pub const Runtime = struct {
         if (requiresGithubMergeAwareness(objective) and
             !self.kernel.capabilities.isAvailable("github.pull_request.merged"))
         {
+            // Idempotency: a candidate already in flight for this
+            // capability is not "available" either (isAvailable is
+            // specifically false for `.candidate`), so without this check
+            // a second `request` here would fork a duplicate task and
+            // worktree rather than pointing at the work already underway.
+            if (self.kernel.inFlightTaskForCapability("github.pull_request.merged")) |existing| {
+                _ = try self.kernel.journal.append(
+                    .capability_missing,
+                    "github.pull_request.merged",
+                    "already in flight; not creating a duplicate task",
+                );
+                return existing.id;
+            }
+
             _ = try self.kernel.journal.append(
                 .capability_missing,
                 "github.pull_request.merged",
@@ -338,6 +352,31 @@ test "request records a failed task rather than crashing when the worktree canno
     try std.testing.expect(task_id != null);
     const task = kernel.findTask(task_id.?).?;
     try std.testing.expectEqual(@import("task.zig").TaskStatus.failed, task.status);
+}
+
+test "request finds an in-flight task for the same capability instead of duplicating it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const cto_root = try std.fs.path.join(alloc, &.{ root, ".cto" });
+
+    var kernel = try kernel_mod.Kernel.init(alloc, cto_root);
+    // A task already exists for this capability and hasn't gone anywhere
+    // yet (`.created`, the status right after creation) — exactly what a
+    // defensively re-issued request should find rather than duplicate.
+    const existing_id = try kernel.createCapabilityTask(
+        "watch merged pull requests",
+        "github.pull_request.merged",
+    );
+
+    var runtime = Runtime.init(alloc, &kernel, root, .dry_run, null);
+    const task_id = try runtime.request("watch merged pull requests, please");
+    try std.testing.expectEqual(existing_id, task_id.?);
+    try std.testing.expectEqual(@as(usize, 1), kernel.tasks.items.len);
 }
 
 fn initTestRepo(alloc: std.mem.Allocator, root: []const u8) !void {
