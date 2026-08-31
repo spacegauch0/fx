@@ -19,12 +19,72 @@ current shape is wrong, the plan changes it rather than working around it.
 | 1. Durable observations, delivery dedup, merge timestamps | Done |
 | 1. Project memory (facts, decisions, outcomes) | Outstanding |
 | 2. GitHub ingestion service — signature verification | Done (M2) |
-| 2. GitHub ingestion service — listener / polling | M5 |
+| 2. GitHub ingestion service — listener / polling | M6 |
 | 3. Planning and supervision | Done (M4) |
 | 4. Version activation and rollback | Done (M3) |
-| 5. Long-running control plane | M5 |
-| 6. Telegram transport | M6 |
-| 7. Proactive loop | M7 |
+| — Agent-native interfaces (brief/explain/schema/`--json`) | M5 |
+| 5. Long-running control plane | M6 |
+| 6. Telegram transport | M7 |
+| 7. Proactive loop | M8 |
+
+## Agent-operating model
+
+A CTO-as-a-service is, by its own premise, operated by an agent — its own
+future self as much as any human. Every `fx cto` invocation that built
+M2–M4 was in fact driven by an agent (the one writing this), and a real,
+measurable share of that work went into re-deriving "what does this
+system look like right now" from `.zig` source and raw JSON files, not
+from anything the system itself offered to say about it. That cost is
+what this section exists to eliminate.
+
+Agent-ergonomic is therefore not a UX layer bolted onto a human-first
+CLI; it is the primary interface contract. A dense, structured, low-noise
+surface that is cheap for an agent to parse and reason about is also easy
+for a human to skim — legibility does not trade off against usability, it
+subsumes it. The reverse does not hold: optimizing purely for a human
+skimming a terminal (today's `std.debug.print` prose, and only that)
+leaves an agent re-parsing English sentences to recover structure that
+was already known at the moment the string was formatted.
+
+Concretely, the system is a **tower of five surfaces**, each a narrower,
+more purpose-built projection of the one below it:
+
+1. **World model** — this document, plus `fx cto schema` (D7). Read
+   once; gives a complete, current, self-generated description of every
+   entity, state, and transition, so a fresh agent session never has to
+   reverse-engineer the shape of `.cto/` from `store.zig`.
+2. **Situational awareness** — `fx cto brief` (D7). One call: what's
+   active, what's blocked and on whom, what's currently running and for
+   how long, what just changed, what to do next. The thing an agent runs
+   first in every session and every check-in.
+3. **Investigation** — `fx cto explain <kind>-<id>` (D7). One call: the
+   complete causal story of one entity, cross-referenced across tasks,
+   runs, releases, and the journal, so tracing "why is task-3 stuck" is a
+   single lookup instead of manually joining four files by hand — which
+   is exactly what every session so far has had to do.
+4. **Action** — `request`, `approve`, `activate`, `rollback`,
+   `interrupt`, … Every mutating command is idempotent, self-narrating
+   (states what happened and suggests `next_actions`), and now defined
+   exactly once: D8 collapses the CLI's and the human-channel bridge's
+   independently maintained notions of "what this system can be asked to
+   do" into one canonical schema, closing a drift that has already
+   happened once.
+5. **Ground truth** — `events.jsonl`. Unchanged in kind: append-only was
+   already the right shape (M1). What changes is that every read surface
+   built on it windows and filters rather than forcing an agent to reread
+   the whole history to answer "what's new" (D7, `--since`).
+
+This tower rests on a principle already present in the code but not yet
+named: **exactly one authoritative source per fact, everything else a
+computed view.** `.cto/current` is the single source of truth for the
+active release, not `releases.json` (M3); `task.status` and
+`capabilities.status` are updated together, inside one function, never
+independently (`Kernel.markCandidate`). `brief`, `explain`, and every
+`--json` view extend this same discipline rather than introduce a second
+place a fact could live: they are pure projections of the tables and the
+journal, recomputed fresh on every call, never independently cached or
+mutated. An agent that has just read `brief` can trust it reflects
+reality with no staleness question left to reason about.
 
 ## Decisions
 
@@ -146,6 +206,134 @@ Retrieval is filtering by subject and kind. No vector store, no graph
 database, no embeddings — explicit non-goals of the original brief, and
 unjustifiable at a scale of hundreds of facts.
 
+### D7 — The read surface is a projection, not a file dump
+
+Today `fx cto status/tasks/goals/runs/releases/events/observations` are
+nine independent, hand-formatted views over nine largely-overlapping
+tables — an agent (or human) reconstructing "what needs my attention"
+has to run several of them and mentally join the results. That join is
+exactly the kind of work a computer should do once, correctly, rather
+than an agent repeating imperfectly from prose every session.
+
+- **`fx cto brief`**: one call, the whole current situation — pending
+  approvals, in-flight runs (with elapsed time against their deadline),
+  recently failed tasks and their one-line reason, capabilities still
+  missing, and a `next_actions` list of concrete commands to run next.
+  Computed fresh from the same tables every other command reads; nothing
+  new is stored.
+- **`fx cto explain <kind>-<id>`**: the full causal narrative for one
+  task, run, goal, or release — its lifecycle, every run it produced
+  (not just the latest), validation results, and the exact journal
+  entries that reference it — cross-referenced automatically instead of
+  requiring `tasks` + `runs` + `events` and manual filtering by id. For a
+  task this subsumes `review`'s diff by summarizing it and pointing at
+  `fx cto review <id>` for the full text, rather than inlining a
+  potentially large diff into a view meant to stay dense.
+- **`fx cto logs <run-id> [--tail N]`**: reads `.cto/runs/<id>.log`
+  (M4) directly. That file exists today only as a path convention a
+  caller already has to know; it should be a first-class command, the
+  same way pid/interrupt-marker bookkeeping already got one
+  (`fx cto interrupt`).
+- **Prefixed ids everywhere**: `task-7`, `run-12`, `release-3`, `goal-2`
+  — displayed everywhere, and accepted everywhere a bare integer is
+  accepted today. Four independent `u64` counters that all start at 1
+  and are displayed as bare `#7` is a standing invitation to conflate a
+  task id with a run id, which is exactly the ambiguity M4 had to design
+  around by hand when scoping `fx cto interrupt` to run ids specifically.
+  Most commands stay lenient (a bare integer is still accepted where the
+  command already scopes the entity kind — `approve`, `activate`,
+  `review`, `rollback` only ever mean a task). `interrupt` and `logs` are
+  the exception: a task id and a run id are both plausible there, so a
+  bare integer is refused with an error naming the `run-` prefix
+  explicitly, rather than silently guessing which counter was meant.
+- **`--since <sequence>` on `events`** (and `observations`): the journal
+  is append-only and unbounded by design (M1); a read surface built on
+  it must let an agent ask "what changed since I last checked" in
+  O(new), not reread the whole history every check-in — the same pattern
+  this project already relies on for watching PR activity externally.
+- **Relative + absolute timestamps**: every view keeps the raw
+  `*_at_ms` field (machine precision, what `explain`'s elapsed-time math
+  uses) and adds a human/agent-legible relative form (`"3m ago"`) next to
+  it, so reasoning about "is this run overdue" doesn't require an
+  epoch-arithmetic step that is also a place to make a mistake.
+- **A scoped test target**: `zig build test-cto`, restricted to
+  `src/cto/**`. This serves the same agent — the one iterating on this
+  system's own code — not its runtime. Today a scoped change has to be
+  validated against the full ~8600-test suite (minutes) or against
+  nothing; a fast, targeted signal is the difference between checking
+  after every edit and batching several edits before daring to check.
+
+*Done when:* a fresh agent session with no prior context can run `fx cto
+schema` once and `fx cto brief` per check-in and have enough information
+to decide its next action without reading any `.cto/*.json` file or any
+`src/cto/*.zig` source directly.
+
+### D8 — One `Command` schema for every transport
+
+`main.zig`'s CLI arg parser and `channel.zig`'s Telegram-text parser
+already each define their own notion of "what this system can be asked
+to do," maintained independently — and they have already drifted:
+`channel.Command` covers `status/goals/runs/decisions/approve/interrupt`
+but has no case for `request`, `activate`, `rollback`, `review`, or
+`ingest`, none of which were deliberately excluded — they were added to
+the CLI after `channel.zig` was written and never backported. That is not
+a bug in either file; it is the predictable cost of defining the same set
+of actions twice.
+
+The fix is structural, not disciplinary: `channel.zig`'s `Command` union
+becomes the canonical action schema for the entire system — extended to
+cover every mutating and read command that exists — and both the CLI arg
+parser and the Telegram-text parser become thin, transport-specific
+functions that produce the same `Command` value, dispatched through one
+executor. M6's control socket (already specified to speak
+"newline-delimited JSON") gets a third parser for free: JSON lines
+deserializing directly into `Command`, using the same D9 envelope
+`--json` output already established. Nothing downstream of parsing —
+authorization, execution, the printed or JSON-rendered result — is
+transport-specific ever again.
+
+This is additive to D2/D3 (trust boundaries, dispatch mechanism), not a
+replacement: which transports may issue which `Command` variants (D5's
+"Telegram cannot approve self-modifying code") is still enforced at the
+boundary, per transport, before dispatch. Only the *shape* of an action
+is unified, not who is allowed to send it.
+
+### D9 — Structured output is primary; text is rendered from it
+
+Every `fx cto` command today calls `std.debug.print` directly — the
+formatted string *is* the only representation of the result, so an agent
+consuming it has to re-derive structure by parsing prose, and any future
+JSON output would be a second, independently-maintained code path that
+can silently drift from what the text says (the same class of problem D8
+closes for the action schema, here applied to the result schema).
+
+Each command instead produces a typed result value first; printing and
+`--json` serialization are two renderers over that one value, so they
+cannot disagree. `--json` wraps every result in a stable envelope —
+`{"kind": "...", "generated_at_ms": ..., "data": ..., "next_actions":
+[...]}` — so a result is self-identifying even read out of context
+(piped through another tool, or re-read from a saved log), and
+`next_actions` travels as data (`{"command": "fx cto approve task-7",
+"reason": "..."}`) rather than only as a sentence a human has to parse to
+find the command to copy. Text stays the default — this remains a CLI a
+human runs by hand — and `--json` is opt-in, matching `gh`/`docker`/
+`kubectl` convention rather than forcing every caller to parse JSON for a
+one-line status check.
+
+**One correctness fix this rethink surfaced, filed here rather than as
+its own decision:** `Runtime.request` checks
+`capabilities.isAvailable(...)` before creating a task, but a capability
+sitting in `.candidate` status (already delegated, awaiting approval) is
+not "available" either — so a second `fx cto request` for the same
+objective while a candidate is already pending creates a *second*,
+parallel, duplicate task and worktree instead of pointing at the one
+already in flight. An agent that re-issues `request` defensively
+(uncertain whether an earlier call succeeded — exactly the situation a
+context compaction or a retried tool call produces) would fork real
+compute this way. Fix: `request` also checks for an existing non-terminal
+task against the same `required_capability` and returns that task's id
+instead of creating a new one when found.
+
 ## Milestones
 
 Ordered so that each is independently reviewable and mergeable, and so
@@ -254,7 +442,7 @@ against that path correctly reports "no out-of-process worker was found"
 rather than claiming to cancel something it cannot reach. `ProcessWorker`
 is complete, tested (spawn/success/failure/timeout/group-cancel/interrupt-
 marker), and reachable from the CLI's `interrupt` bookkeeping today; it
-becomes what actually serves `fx cto request` when M5's daemon exists to
+becomes what actually serves `fx cto request` when M6's daemon exists to
 own concurrent dispatch, exactly as D3 describes the split. Building the
 mechanism now and switching the default later, rather than switching the
 default onto a mechanism validated only in isolation, is the deliberate
@@ -262,31 +450,75 @@ order — matches this project's own precedent of catching the real bugs
 (the `FileNotFound`, the empty release commit) only once the *real*
 binary was exercised, not just unit tests.
 
-### M5 — Daemon and control plane
+### M5 — Agent-native interfaces
+
+Implements D7, D8, and D9. Pure CLI-side legibility work — no daemon
+required, nothing here is blocked on M6 — and deliberately ordered
+*before* the daemon rather than after, for two reasons: it directly
+improves the efficiency of every session that builds M6–M8 (this is the
+same system its own future development leans on), and the daemon's
+control socket is specified to speak newline-delimited JSON — landing
+the `Command` schema and the `--json` envelope first means the socket
+protocol is "reuse what already exists," not "invent a third wire
+format under time pressure."
+
+- `fx cto brief`, `fx cto explain <kind>-<id>`, `fx cto logs <run-id>`
+  (D7).
+- Prefixed ids (`task-N`/`run-N`/`release-N`/`goal-N`) displayed
+  everywhere; accepted everywhere, with `interrupt`/`logs` requiring the
+  `run-` prefix specifically (D7).
+- `--since <sequence>` on `events`/`observations` (D7).
+- `fx cto schema`: machine-readable description of every entity and
+  event kind, generated from the same types `store.zig` already defines
+  — not hand-maintained prose that can drift from the code.
+- `--json` on every read command, plus the structured-result-first
+  refactor and `next_actions` it depends on (D9).
+- `channel.Command` extended to cover the full action surface and
+  adopted by the CLI parser as its only implementation of "what this
+  system can be asked to do" (D8).
+- `request`'s idempotency fix (filed under D9).
+- `zig build test-cto`, scoped to `src/cto/**`.
+
+*Done when:* a fresh agent session with no prior context can run `fx cto
+schema` once and `fx cto brief` per check-in and have enough information
+to decide its next action without reading any `.cto/*.json` file or any
+`src/cto/*.zig` source directly. (Same criterion as D7 — this milestone
+exists to satisfy it.)
+
+### M6 — Daemon and control plane
 
 - `fx cto daemon` — foreground, supervised-friendly, structured logs.
 - Single-writer lock per D4.
-- Unix control socket per D2, speaking newline-delimited JSON.
+- Unix control socket per D2, speaking newline-delimited JSON —
+  deserializing directly into the `Command` schema M5 established (D8).
 - Loopback webhook endpoint (opt-in) and the polling alternative
   (default).
 - `/health` and `/ready`.
 - CLI auto-detects a running daemon and proxies to it.
+- `ProcessWorker` (M4) becomes the default dispatch path. This needs one
+  small, honestly-scoped change: `Runtime` today holds a concrete
+  `FxWorker`, not the type-erased `worker.Worker` it could hold instead —
+  widen that field so the CLI's composition root keeps constructing an
+  `FxWorker`/`LiveRunner`-backed `Worker` (unchanged) while the daemon
+  constructs a `ProcessWorker`-backed one. Same seam D3 already
+  describes, sized to fit the second implementation M4 already built for
+  it.
 
 *Done when:* the daemon survives terminal exit, a second writer is
 refused rather than corrupting state, and every existing `fx cto`
 command works identically with and without a daemon running.
 
-### M6 — Telegram transport
+### M7 — Telegram transport
 
 Long polling by default (outbound only). Chat-ID allowlist. Token from
-the secret store. Parsed `channel.Command` → control socket. Concise
-approval requests and failure notices. D5's restriction enforced kernel-
-side, not just in the bot.
+the secret store. Parsed via the shared `Command` schema (D8) → control
+socket. Concise approval requests and failure notices. D5's restriction
+enforced kernel-side, not just in the bot.
 
 *Done when:* an allowlisted chat can drive every read command and a
 non-allowlisted chat gets nothing, proven without a live bot token.
 
-### M7 — Proactive loop
+### M8 — Proactive loop
 
 Reconcile new observations against active goals and memory; propose or
 delegate only where policy allows; require approval before any sensitive

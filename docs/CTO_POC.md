@@ -214,6 +214,19 @@ no-op today (worker cancellation isn't implemented).
 
 ## Known limitations / what's next
 
+- **Read output is nine independent hand-formatted views, not one
+  situational surface.** `status`/`tasks`/`goals`/`runs`/`releases`/
+  `events`/`observations` each show a fragment; there is no single call
+  that says "here's what's happening and what needs you," no
+  cross-referenced drill-down into one task/run's full story, no `--json`,
+  and ids are four independently-numbered `u64` counters displayed as
+  bare `#7` — a task id and a run id can and do collide numerically. This
+  is real friction for exactly the kind of operator this system is built
+  for (an agent driving it, not a human eyeballing a terminal); see
+  `docs/CTO_ROADMAP.md`'s "Agent-operating model" and D7–D9 for the
+  planned fix (`brief`, `explain`, `schema`, prefixed ids, `--json`) —
+  roadmap milestone M5, ordered before the daemon precisely so the rest
+  of this project's own development benefits from it too.
 - **No webhook receiver, no Telegram transport, no daemon.** `fx cto
   ingest` and `fx cto channel` are the trusted-side halves of ingestion
   and human control; nothing here listens on a socket, verifies a webhook
