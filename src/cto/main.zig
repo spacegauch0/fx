@@ -123,6 +123,7 @@ fn runInner(
     }
     if (std.mem.eql(u8, command, "channel")) return runChannel(alloc, &kernel, args);
     if (std.mem.eql(u8, command, "interrupt")) return runInterrupt(alloc, &kernel, args);
+    if (std.mem.eql(u8, command, "logs")) return runLogs(alloc, &kernel, args);
     if (std.mem.eql(u8, command, "observations")) {
         try printObservations(&kernel);
         return 0;
@@ -625,6 +626,90 @@ fn interruptRun(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, run_id: u6
     return 0;
 }
 
+/// Reads `.cto/runs/<run-id>.log` (M4's `process_worker.zig`) directly.
+/// Always CLI-direct, never proxied to a daemon: this is a plain file read
+/// with no kernel state or locking involved, so a daemon has nothing to
+/// mediate here.
+fn runLogs(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
+    if (args.len < 2) {
+        std.debug.print("usage: fx cto logs <run-id> [--tail N]\n", .{});
+        return 1;
+    }
+    const run_id = id_mod.parseStrict(.run, args[1]) orelse {
+        std.debug.print(
+            "fx cto logs: `{s}` is not a valid run id — use the `run-<id>` form (e.g. `run-12`), " ++
+                "not a bare number\n",
+            .{args[1]},
+        );
+        return 1;
+    };
+
+    var tail_lines: ?usize = null;
+    var index: usize = 2;
+    while (index < args.len) : (index += 1) {
+        if (std.mem.eql(u8, args[index], "--tail")) {
+            index += 1;
+            if (index >= args.len) {
+                std.debug.print("fx cto logs: --tail requires a value\n", .{});
+                return 1;
+            }
+            tail_lines = std.fmt.parseInt(usize, args[index], 10) catch {
+                std.debug.print("fx cto logs: `{s}` is not a valid --tail count\n", .{args[index]});
+                return 1;
+            };
+        } else {
+            std.debug.print("fx cto logs: unexpected argument `{s}`\n", .{args[index]});
+            return 1;
+        }
+    }
+
+    const log_path = try process_worker.logFilePath(alloc, kernel.cto_root, run_id);
+    defer alloc.free(log_path);
+    var file = std.Io.Dir.openFileAbsolute(io_mod.getIo(), log_path, .{}) catch |err| {
+        var id_buf: [32]u8 = undefined;
+        const label = id_mod.formatBuf(&id_buf, .run, run_id);
+        switch (err) {
+            error.FileNotFound => std.debug.print(
+                "no log recorded for {s}: it may not have dispatched out-of-process, or hasn't finished yet\n",
+                .{label},
+            ),
+            else => std.debug.print("fx cto logs: could not read {s}'s log: {s}\n", .{ label, @errorName(err) }),
+        }
+        return 1;
+    };
+    defer file.close(io_mod.getIo());
+    const text = try io_mod.readFileToEnd(alloc, &file, 16 * 1024 * 1024);
+    defer alloc.free(text);
+
+    std.debug.print("{s}", .{if (tail_lines) |n| tailLines(text, n) else text});
+    return 0;
+}
+
+/// Returns the last `n` lines of `text` (a suffix slice, no copy). A log
+/// this size (M4 caps each stream at 64KB) is small enough that scanning
+/// backward for newlines is simpler and plenty fast, versus counting
+/// lines forward and remembering a rolling window.
+fn tailLines(text: []const u8, n: usize) []const u8 {
+    if (n == 0) return "";
+    // A trailing newline terminates the last line rather than separating
+    // it from a line after it; exclude it from the scan so "the last 1
+    // line" of "a\nb\nc\n" is "c\n", not "" (the boundary crossed by that
+    // very last byte).
+    var search_end = text.len;
+    if (search_end > 0 and text[search_end - 1] == '\n') search_end -= 1;
+
+    var remaining = n;
+    var i = search_end;
+    while (i > 0) {
+        i -= 1;
+        if (text[i] == '\n') {
+            remaining -= 1;
+            if (remaining == 0) return text[i + 1 ..];
+        }
+    }
+    return text;
+}
+
 fn printHelp() void {
     std.debug.print(
         \\fx cto - a CTO runtime layered on top of the fx coding harness
@@ -646,6 +731,7 @@ fn printHelp() void {
         \\  releases                  List versioned releases and the active one
         \\  rollback                  Point the active release at the previous version
         \\  interrupt <run-id>        Cancel an out-of-process worker run
+        \\  logs <run-id> [--tail N]  Show a worker run's captured stdout/stderr
         \\  events                    Show the append-only audit journal
         \\  daemon [--once]           Run the local control-plane daemon (foreground)
         \\  ctl '<json>'              Send one versioned control-protocol request
@@ -708,6 +794,14 @@ test "isHelp recognizes help spellings and rejects other commands" {
     try std.testing.expect(isHelp("--help"));
     try std.testing.expect(isHelp("-h"));
     try std.testing.expect(!isHelp("status"));
+}
+
+test "tailLines returns the last n lines, or the whole text when there are fewer" {
+    try std.testing.expectEqualStrings("c\n", tailLines("a\nb\nc\n", 1));
+    try std.testing.expectEqualStrings("b\nc\n", tailLines("a\nb\nc\n", 2));
+    try std.testing.expectEqualStrings("a\nb\nc\n", tailLines("a\nb\nc\n", 10));
+    try std.testing.expectEqualStrings("", tailLines("a\nb\nc\n", 0));
+    try std.testing.expectEqualStrings("no newline", tailLines("no newline", 3));
 }
 
 test "runInner routes status, capabilities, request, tasks, events, and approve" {
