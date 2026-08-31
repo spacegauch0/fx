@@ -72,7 +72,7 @@ pub const FxWorker = struct {
         defer allocator.free(prompt_path);
         io_mod.writeFileAtomic(allocator, prompt_path, request.prompt) catch |err| {
             return .{
-                .success = false,
+                .outcome = .failed,
                 .summary = try std.fmt.allocPrint(
                     allocator,
                     "failed to record the implementation task in the worktree: {s}",
@@ -83,7 +83,7 @@ pub const FxWorker = struct {
 
         return switch (self.dispatch) {
             .dry_run => .{
-                .success = true,
+                .outcome = .succeeded,
                 .summary = try std.fmt.allocPrint(
                     allocator,
                     "cto-dev prepared the task in {s} (prompt recorded at {s}); " ++
@@ -102,7 +102,7 @@ pub const FxWorker = struct {
     ) !worker_mod.WorkResult {
         const runner = self.live_runner orelse {
             return .{
-                .success = false,
+                .outcome = .failed,
                 .summary = try allocator.dupe(u8, "fx agent runtime is unavailable"),
             };
         };
@@ -120,7 +120,7 @@ test "live dispatch uses the injected fx runtime" {
             probe.called = true;
             try std.testing.expectEqualStrings(probe.expected_worktree, request.worktree_path);
             return .{
-                .success = true,
+                .outcome = .succeeded,
                 .summary = try alloc.dupe(u8, "agent completed"),
             };
         }
@@ -138,12 +138,14 @@ test "live dispatch uses the injected fx runtime" {
     };
     const result = try worker.run(std.testing.allocator, .{
         .task_id = 1,
+        .run_id = 1,
         .repository_path = root,
         .worktree_path = root,
+        .cto_root = root,
         .prompt = "implement it",
     });
     defer std.testing.allocator.free(result.summary);
 
     try std.testing.expect(probe.called);
-    try std.testing.expect(result.success);
+    try std.testing.expect(result.success());
 }

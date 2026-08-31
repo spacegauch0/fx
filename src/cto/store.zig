@@ -135,7 +135,8 @@ pub fn loadRuns(alloc: std.mem.Allocator, cto_root_abs: []const u8) ![]run_mod.R
         const task_id = jsonInt(obj, "task_id") orelse continue;
         const worker = jsonString(obj, "worker") orelse continue;
         const status = std.meta.stringToEnum(run_mod.Status, jsonString(obj, "status") orelse "started") orelse .started;
-        try runs.append(alloc, .{ .id = @intCast(id), .task_id = @intCast(task_id), .worker = try alloc.dupe(u8, worker), .status = status, .started_at_ms = jsonInt(obj, "started_at_ms") orelse 0, .finished_at_ms = jsonInt(obj, "finished_at_ms") });
+        const finished_reason = if (jsonString(obj, "finished_reason")) |value| try alloc.dupe(u8, value) else null;
+        try runs.append(alloc, .{ .id = @intCast(id), .task_id = @intCast(task_id), .worker = try alloc.dupe(u8, worker), .status = status, .started_at_ms = jsonInt(obj, "started_at_ms") orelse 0, .finished_at_ms = jsonInt(obj, "finished_at_ms"), .finished_reason = finished_reason });
     }
     return runs.toOwnedSlice(alloc);
 }

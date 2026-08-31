@@ -6,6 +6,8 @@ const fx_worker_mod = @import("fx_worker.zig");
 const git = @import("git.zig");
 const io_mod = @import("../core/shared/io.zig");
 const kernel_mod = @import("kernel.zig");
+const run_mod = @import("run.zig");
+const worker_mod = @import("worker.zig");
 const workspace_mod = @import("workspace.zig");
 
 /// Accepts a human request, decides whether it needs a capability CTO does
@@ -121,32 +123,15 @@ pub const Runtime = struct {
         );
         defer self.allocator.free(prompt);
 
-        _ = try self.kernel.journal.append(.worker_started, "cto-dev", "fx");
-        const run_id = try self.kernel.startRun(task_id, "fx");
+        const result = try self.dispatchWithRetry(task_id, worktree_path, prompt) orelse return;
 
-        var adapter = self.fx_worker.asWorker();
-        const result = adapter.run(self.allocator, .{
-            .task_id = task_id,
-            .repository_path = self.counterpart.repository_path,
-            .worktree_path = worktree_path,
-            .prompt = prompt,
-        }) catch |err| {
-            try self.kernel.finishRun(run_id, false);
-            const reason = try std.fmt.allocPrint(self.allocator, "worker crashed: {s}", .{@errorName(err)});
-            defer self.allocator.free(reason);
-            try self.kernel.markFailed(task_id, reason);
-            return;
-        };
-
-        if (!result.success) {
-            try self.kernel.finishRun(run_id, false);
-            try self.kernel.markFailed(task_id, result.summary);
-            return;
+        switch (result.outcome) {
+            .succeeded => _ = try self.kernel.journal.append(.worker_completed, "cto-dev", result.summary),
+            .failed, .timed_out, .interrupted => {
+                try self.kernel.markFailed(task_id, result.summary);
+                return;
+            },
         }
-
-        try self.kernel.finishRun(run_id, true);
-
-        _ = try self.kernel.journal.append(.worker_completed, "cto-dev", result.summary);
 
         const validation = candidate_mod.validate(self.allocator, worktree_path) catch |err| {
             const reason = try std.fmt.allocPrint(
@@ -173,7 +158,83 @@ pub const Runtime = struct {
 
         try self.kernel.markCandidate(task_id, branch, worktree_path, validation.build_ok, validation.test_ok);
     }
+
+    /// Dispatches one worker attempt, retrying only a crash of the dispatch
+    /// mechanism itself (`adapter.run` returning a Zig error: a failed
+    /// spawn, a wait4 failure, a filesystem hiccup) — never a semantic
+    /// outcome the worker actually reported (`.failed`, `.timed_out`,
+    /// `.interrupted`). Retrying those would mean silently re-running a
+    /// model attempt, which is spending without the approval that requires
+    /// — "Act narrowly" — so a real attempt's result is always surfaced to
+    /// the human once, not looped on.
+    ///
+    /// Returns `null` (with the task already marked failed) once attempts
+    /// are exhausted; otherwise returns the terminal `WorkResult`.
+    fn dispatchWithRetry(
+        self: *Runtime,
+        task_id: u64,
+        worktree_path: []const u8,
+        prompt: []const u8,
+    ) !?worker_mod.WorkResult {
+        const max_dispatch_attempts: u32 = 3;
+        var attempt: u32 = 1;
+        while (true) : (attempt += 1) {
+            const detail = if (attempt == 1)
+                try self.allocator.dupe(u8, "fx")
+            else
+                try std.fmt.allocPrint(self.allocator, "fx (attempt {d})", .{attempt});
+            defer self.allocator.free(detail);
+            _ = try self.kernel.journal.append(.worker_started, "cto-dev", detail);
+
+            const run_id = try self.kernel.startRun(task_id, "fx");
+            var adapter = self.fx_worker.asWorker();
+            const attempt_result = adapter.run(self.allocator, .{
+                .task_id = task_id,
+                .run_id = run_id,
+                .repository_path = self.counterpart.repository_path,
+                .worktree_path = worktree_path,
+                .cto_root = self.kernel.cto_root,
+                .prompt = prompt,
+            });
+
+            if (attempt_result) |ok| {
+                const status: run_mod.Status = switch (ok.outcome) {
+                    .succeeded => .succeeded,
+                    .failed => .failed,
+                    .timed_out, .interrupted => .interrupted,
+                };
+                const reason: ?[]const u8 = switch (ok.outcome) {
+                    .succeeded => null,
+                    .failed => "worker reported failure",
+                    .timed_out => "timeout",
+                    .interrupted => "interrupted by operator",
+                };
+                try self.kernel.finishRun(run_id, status, reason);
+                return ok;
+            } else |err| {
+                try self.kernel.finishRun(run_id, .failed, @errorName(err));
+                if (attempt >= max_dispatch_attempts) {
+                    const reason = try std.fmt.allocPrint(
+                        self.allocator,
+                        "worker crashed after {d} attempt(s): {s}",
+                        .{ attempt, @errorName(err) },
+                    );
+                    defer self.allocator.free(reason);
+                    try self.kernel.markFailed(task_id, reason);
+                    return null;
+                }
+                io_mod.sleep(dispatchBackoffMs(attempt) * std.time.ns_per_ms);
+            }
+        }
+    }
 };
+
+/// Exponential backoff between dispatch-crash retries: 2s, 4s, ... This is
+/// real wall-clock time by design — it only ever runs after the dispatch
+/// mechanism itself has crashed, which existing tests never trigger.
+fn dispatchBackoffMs(completed_attempt: u32) u64 {
+    return @as(u64, 2000) << @intCast(completed_attempt - 1);
+}
 
 fn requiresGithubMergeAwareness(objective: []const u8) bool {
     const haystack = objective;

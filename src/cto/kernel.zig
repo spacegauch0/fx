@@ -130,14 +130,27 @@ pub const Kernel = struct {
         return id;
     }
 
-    pub fn finishRun(self: *Kernel, run_id: u64, succeeded: bool) !void {
+    /// `reason` is recorded on the run and in the journal only for a
+    /// non-`.succeeded` status (e.g. a crash's error name, "timeout", or
+    /// "interrupted by operator"); pass `null` for `.succeeded`.
+    pub fn finishRun(self: *Kernel, run_id: u64, status: run_mod.Status, reason: ?[]const u8) !void {
         for (self.runs.items) |*run| if (run.id == run_id) {
-            run.status = if (succeeded) .succeeded else .failed;
+            run.status = status;
             run.finished_at_ms = io_mod.milliTimestamp();
-            _ = try self.journal.append(.run_finished, run.worker, if (succeeded) "succeeded" else "failed");
+            run.finished_reason = if (reason) |r| try self.allocator.dupe(u8, r) else null;
+            _ = try self.journal.append(.run_finished, run.worker, reason orelse @tagName(status));
             return store.saveRuns(self.allocator, self.cto_root, self.runs.items);
         };
         return error.RunNotFound;
+    }
+
+    /// Audits an `fx cto interrupt <run-id>` request regardless of whether
+    /// a running worker was actually found for it — the attempt itself is
+    /// part of the trail, per "preserve an audit trail."
+    pub fn recordInterruptRequest(self: *Kernel, run_id: u64, outcome: []const u8) !void {
+        var buf: [32]u8 = undefined;
+        const subject = std.fmt.bufPrint(&buf, "{d}", .{run_id}) catch "run";
+        _ = try self.journal.append(.interrupt_requested, subject, outcome);
     }
 
     /// Records a normalized observation unless one with the same

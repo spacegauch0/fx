@@ -12,6 +12,7 @@ const registry = @import("extensions/registry.zig");
 const ingest_auth = @import("ingest_auth.zig");
 const secrets = @import("secrets.zig");
 const release_mod = @import("release.zig");
+const process_worker = @import("process_worker.zig");
 
 comptime {
     _ = @import("extension_contract.zig");
@@ -91,7 +92,8 @@ fn runInner(
         printDecisions(&kernel);
         return 0;
     }
-    if (std.mem.eql(u8, command, "channel")) return runChannel(&kernel, args);
+    if (std.mem.eql(u8, command, "channel")) return runChannel(alloc, &kernel, args);
+    if (std.mem.eql(u8, command, "interrupt")) return runInterrupt(alloc, &kernel, args);
     if (std.mem.eql(u8, command, "observations")) {
         printObservations(&kernel);
         return 0;
@@ -410,7 +412,7 @@ fn runRollback(kernel: *kernel_mod.Kernel) !u8 {
 
 /// Entry point for a thin human-channel bridge. The bridge only forwards
 /// text; all authorization and state changes remain owned by this CLI.
-fn runChannel(kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
+fn runChannel(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
     if (args.len < 2) {
         std.debug.print("usage: fx cto channel \"/status\"\n", .{});
         return 1;
@@ -434,14 +436,60 @@ fn runChannel(kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
             );
             return 1;
         },
-        .interrupt => |id| {
-            std.debug.print("task #{d} interruption is not implemented yet; worker cancellation is a planned daemon capability.\n", .{id});
-        },
+        .interrupt => |id| return interruptRun(alloc, kernel, id),
         .invalid => |text| {
             std.debug.print("unsupported channel command: {s}\n", .{text});
             return 1;
         },
     }
+    return 0;
+}
+
+fn runInterrupt(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const [:0]const u8) !u8 {
+    if (args.len < 2) {
+        std.debug.print("usage: fx cto interrupt <run-id>\n", .{});
+        return 1;
+    }
+    const run_id = std.fmt.parseInt(u64, args[1], 10) catch {
+        std.debug.print("fx cto interrupt: `{s}` is not a valid run id\n", .{args[1]});
+        return 1;
+    };
+    return interruptRun(alloc, kernel, run_id);
+}
+
+/// Cancels a run dispatched out-of-process (`process_worker.zig`) by
+/// writing an interrupt marker next to its pid file. The owning process's
+/// supervision loop — not this CLI invocation — is what actually signals
+/// the worker's process group; that keeps there being exactly one signaler
+/// even when `interrupt` runs concurrently with the run it is cancelling.
+///
+/// A run dispatched in-process (today's CLI default, see docs/CTO_ROADMAP.md
+/// D3) has no pid file to find: it blocks the single `fx cto request`
+/// invocation that started it and cannot be reached from a second process
+/// at all. That is reported honestly rather than claimed as done.
+fn interruptRun(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, run_id: u64) !u8 {
+    const pid = process_worker.readPid(alloc, kernel.cto_root, run_id) catch |err| {
+        std.debug.print("fx cto interrupt: could not check run #{d}: {s}\n", .{ run_id, @errorName(err) });
+        return 1;
+    };
+    if (pid == null) {
+        try kernel.recordInterruptRequest(run_id, "no out-of-process worker found for this run");
+        std.debug.print(
+            "no running out-of-process worker was found for run #{d}.\n" ++
+                "It may have already finished, or it was dispatched in-process (the CLI default),\n" ++
+                "which cannot be cancelled from a separate command.\n",
+            .{run_id},
+        );
+        return 1;
+    }
+    const marker_path = try process_worker.interruptMarkerPath(alloc, kernel.cto_root, run_id);
+    defer alloc.free(marker_path);
+    io_mod.writeFileAtomic(alloc, marker_path, "") catch |err| {
+        std.debug.print("fx cto interrupt: could not signal run #{d}: {s}\n", .{ run_id, @errorName(err) });
+        return 1;
+    };
+    try kernel.recordInterruptRequest(run_id, "signaled");
+    std.debug.print("requested cancellation of run #{d} (pid {d}); it will stop shortly.\n", .{ run_id, pid.? });
     return 0;
 }
 
@@ -465,6 +513,7 @@ fn printHelp() void {
         \\  activate <task-id>        Retry activation of an approved candidate
         \\  releases                  List versioned releases and the active one
         \\  rollback                  Point the active release at the previous version
+        \\  interrupt <run-id>        Cancel an out-of-process worker run
         \\  events                    Show the append-only audit journal
         \\
     , .{});
@@ -531,7 +580,14 @@ fn printRuns(kernel: *kernel_mod.Kernel) void {
         return;
     }
     for (kernel.runs.items) |worker_run| {
-        std.debug.print("#{d} task #{d} [{s}] {s}\n", .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker });
+        if (worker_run.finished_reason) |reason| {
+            std.debug.print(
+                "#{d} task #{d} [{s}] {s} ({s})\n",
+                .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker, reason },
+            );
+        } else {
+            std.debug.print("#{d} task #{d} [{s}] {s}\n", .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker });
+        }
     }
 }
 

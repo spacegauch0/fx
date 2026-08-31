@@ -28,6 +28,7 @@ pub const EventKind = enum {
     release_health_failed,
     release_activated,
     release_rolled_back,
+    interrupt_requested,
 };
 
 pub const Event = struct {

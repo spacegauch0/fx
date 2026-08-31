@@ -3152,7 +3152,7 @@ fn runCtoFxWorker(
     try std.process.setCurrentPath(io_mod.getIo(), original_cwd);
     restore_needed = false;
     return .{
-        .success = exit_code == 0,
+        .outcome = if (exit_code == 0) .succeeded else .failed,
         .summary = try std.fmt.allocPrint(
             alloc,
             "fx agent ({s}) in {s}",

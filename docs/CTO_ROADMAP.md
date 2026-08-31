@@ -20,7 +20,7 @@ current shape is wrong, the plan changes it rather than working around it.
 | 1. Project memory (facts, decisions, outcomes) | Outstanding |
 | 2. GitHub ingestion service — signature verification | Done (M2) |
 | 2. GitHub ingestion service — listener / polling | M5 |
-| 3. Planning and supervision | M4 |
+| 3. Planning and supervision | Done (M4) |
 | 4. Version activation and rollback | Done (M3) |
 | 5. Long-running control plane | M5 |
 | 6. Telegram transport | M6 |
@@ -208,18 +208,59 @@ a live process stays out of scope.
 
 Still outstanding from this milestone: `.cto/memory.jsonl` per D6.
 
-### M4 — Supervision
+### M4 — Supervision — **done**
 
-- Subprocess worker dispatch per D3.
-- Per-run timeout and deadline; bounded, truncated log capture into
-  `.cto/runs/<id>.log`.
-- Retry with backoff, capped, recorded per attempt.
-- Real cancellation: `/interrupt <id>` signals the child's process group,
-  marks the run `.interrupted`, and leaves the worktree for inspection.
+- `src/cto/process_worker.zig`: out-of-process worker dispatch per D3. The
+  child is spawned as its own process **group** (`pgid = 0`), and every
+  signal this worker sends targets `-pid` (the group), not `pid` (the one
+  process `Child.kill` would reach) — so cancellation reaches every
+  subprocess the worker spawns in turn, not just the direct `fx ask`
+  child (a coding agent runs shell tool calls, which are exactly the
+  grandchildren a single-pid signal would miss). A trailing group-wide
+  kill after every reap — not only on timeout/interrupt — sweeps up
+  anything the child backgrounded and detached before exiting normally.
+- Per-run wall-clock timeout, enforced by the worker's own supervision
+  loop (a non-blocking `wait4(..., WNOHANG)` poll, not the blocking
+  `Child.wait`/`Child.kill` pair, which only ever signal one pid and
+  cannot be raced against a deadline from the same call). On expiry:
+  SIGTERM to the group, a grace period, then SIGKILL if it hasn't exited
+  — exercised by a test whose spawned process traps and ignores SIGTERM,
+  so only a real group-wide SIGKILL can end it before its 30s `sleep`
+  would otherwise outlast the test.
+- Bounded, truncated log capture: stdout/stderr are drained on background
+  threads (so a chatty child never blocks on a full pipe buffer while the
+  supervision loop is deciding whether to kill it) into a capped buffer,
+  written to `.cto/runs/<id>.log`.
+- Real cancellation: `fx cto interrupt <run-id>` (and `/interrupt` on the
+  channel bridge) writes an interrupt marker next to the run's pid file.
+  The *owning* supervision loop, not the `interrupt` invocation, is what
+  signals the process group — keeping exactly one signaler even when
+  interrupt runs concurrently with the run it is cancelling. The request
+  itself is always journaled (`interrupt_requested`), including when no
+  running worker was found.
+- Retry with backoff (2s, 4s; capped at 3 attempts), but scoped narrowly:
+  only a crash of the dispatch mechanism itself (a failed spawn, a wait4
+  failure) is retried, recorded per attempt in `fx cto runs`. A worker
+  that actually ran and reported `.failed`/`.timed_out`/`.interrupted` is
+  never auto-retried — that would mean silently re-running a model
+  attempt (spending) without the approval "Act narrowly" requires, and it
+  is real information a human should see once, not have looped past them.
 
-*Done when:* `/interrupt` stops a real running worker, a timeout is
-indistinguishable in the audit trail from a cancellation only by its
-recorded reason, and no orphan child survives daemon shutdown.
+**Scope note, honestly stated:** the CLI's default `fx cto request` path
+still dispatches in-process (`FxWorker`/`LiveRunner`, unchanged, per D3's
+own reasoning: `setCurrentPath` is process-global and a blocking call
+cannot be preempted regardless of which milestone we're in). `interrupt`
+against that path correctly reports "no out-of-process worker was found"
+rather than claiming to cancel something it cannot reach. `ProcessWorker`
+is complete, tested (spawn/success/failure/timeout/group-cancel/interrupt-
+marker), and reachable from the CLI's `interrupt` bookkeeping today; it
+becomes what actually serves `fx cto request` when M5's daemon exists to
+own concurrent dispatch, exactly as D3 describes the split. Building the
+mechanism now and switching the default later, rather than switching the
+default onto a mechanism validated only in isolation, is the deliberate
+order — matches this project's own precedent of catching the real bugs
+(the `FileNotFound`, the empty release commit) only once the *real*
+binary was exercised, not just unit tests.
 
 ### M5 — Daemon and control plane
 
