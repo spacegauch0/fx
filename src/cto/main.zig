@@ -13,6 +13,7 @@ const ingest_auth = @import("ingest_auth.zig");
 const secrets = @import("secrets.zig");
 const process_worker = @import("process_worker.zig");
 const views = @import("views.zig");
+const id_mod = @import("id.zig");
 const control_protocol = @import("control_protocol.zig");
 const control_client = @import("control_client.zig");
 const daemon_mod = @import("daemon.zig");
@@ -246,25 +247,27 @@ fn runReview(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []const
         std.debug.print("usage: fx cto review <task-id>\n", .{});
         return 1;
     }
-    const id = std.fmt.parseInt(u64, args[1], 10) catch {
+    const id = id_mod.parse(.task, args[1]) orelse {
         std.debug.print("fx cto review: `{s}` is not a valid task id\n", .{args[1]});
         return 1;
     };
+    var id_buf: [32]u8 = undefined;
+    const label = id_mod.formatBuf(&id_buf, .task, id);
     const task = kernel.findTask(id) orelse {
-        std.debug.print("fx cto review: task #{d} was not found\n", .{id});
+        std.debug.print("fx cto review: {s} was not found\n", .{label});
         return 1;
     };
     const worktree_path = task.worktree_path orelse {
-        std.debug.print("fx cto review: task #{d} has no candidate worktree\n", .{id});
+        std.debug.print("fx cto review: {s} has no candidate worktree\n", .{label});
         return 1;
     };
     const diff = git.extensionDiff(alloc, worktree_path) catch |err| {
-        std.debug.print("fx cto review: could not render task #{d}: {s}\n", .{ id, @errorName(err) });
+        std.debug.print("fx cto review: could not render {s}: {s}\n", .{ label, @errorName(err) });
         return 1;
     };
     defer alloc.free(diff);
     if (diff.len == 0) {
-        std.debug.print("task #{d} has no extension changes\n", .{id});
+        std.debug.print("{s} has no extension changes\n", .{label});
     } else {
         std.debug.print("{s}", .{diff});
     }
@@ -419,20 +422,22 @@ fn runRequest(
         return 0;
     };
     const task = kernel.findTask(id) orelse return error.TaskNotFound;
+    var id_buf: [32]u8 = undefined;
+    const label = id_mod.formatBuf(&id_buf, .task, id);
     switch (task.status) {
         .approval_required => std.debug.print(
-            "CTO created self-extension task #{d} for `{s}`; a candidate is ready and requires approval.\n" ++
-                "Run `fx cto approve {d}` to activate it, or `fx cto events` to review the audit trail.\n",
-            .{ id, task.required_capability, id },
+            "CTO created self-extension {s} for `{s}`; a candidate is ready and requires approval.\n" ++
+                "Run `fx cto approve {s}` to activate it, or `fx cto events` to review the audit trail.\n",
+            .{ label, task.required_capability, label },
         ),
         .failed => std.debug.print(
-            "CTO created self-extension task #{d} for `{s}`, but the worker run failed.\n" ++
+            "CTO created self-extension {s} for `{s}`, but the worker run failed.\n" ++
                 "Run `fx cto events` for detail; the task and any partial worktree were left in place.\n",
-            .{ id, task.required_capability },
+            .{ label, task.required_capability },
         ),
         else => std.debug.print(
-            "CTO created self-extension task #{d} for `{s}` (status={s}).\n",
-            .{ id, task.required_capability, @tagName(task.status) },
+            "CTO created self-extension {s} for `{s}` (status={s}).\n",
+            .{ label, task.required_capability, @tagName(task.status) },
         ),
     }
     return 0;
@@ -448,13 +453,14 @@ fn runApprove(
         std.debug.print("usage: fx cto approve <task-id>\n", .{});
         return 1;
     }
-    const id = std.fmt.parseInt(u64, args[1], 10) catch {
+    const id = id_mod.parse(.task, args[1]) orelse {
         std.debug.print("fx cto approve: `{s}` is not a valid task id\n", .{args[1]});
         return 1;
     };
     const repo = try store.resolveAbsolute(alloc, repository_path);
     const outcome = kernel.approve(repo, id) catch |err| {
-        std.debug.print("fx cto approve: could not approve task #{d}: {s}\n", .{ id, @errorName(err) });
+        var id_buf: [32]u8 = undefined;
+        std.debug.print("fx cto approve: could not approve {s}: {s}\n", .{ id_mod.formatBuf(&id_buf, .task, id), @errorName(err) });
         return 1;
     };
     return reportActivation(id, outcome);
@@ -470,35 +476,38 @@ fn runActivate(
         std.debug.print("usage: fx cto activate <task-id>\n", .{});
         return 1;
     }
-    const id = std.fmt.parseInt(u64, args[1], 10) catch {
+    const id = id_mod.parse(.task, args[1]) orelse {
         std.debug.print("fx cto activate: `{s}` is not a valid task id\n", .{args[1]});
         return 1;
     };
     const repo = try store.resolveAbsolute(alloc, repository_path);
     const outcome = kernel.activate(repo, id) catch |err| {
-        std.debug.print("fx cto activate: could not activate task #{d}: {s}\n", .{ id, @errorName(err) });
+        var id_buf: [32]u8 = undefined;
+        std.debug.print("fx cto activate: could not activate {s}: {s}\n", .{ id_mod.formatBuf(&id_buf, .task, id), @errorName(err) });
         return 1;
     };
     return reportActivation(id, outcome);
 }
 
 fn reportActivation(id: u64, outcome: kernel_mod.Kernel.ActivationOutcome) u8 {
+    var id_buf: [32]u8 = undefined;
+    const label = id_mod.formatBuf(&id_buf, .task, id);
     switch (outcome) {
         .activated => |release| {
             std.debug.print(
-                "Approved task #{d}. Release v{d} is built, tested, and active.\n" ++
+                "Approved {s}. Release v{d} is built, tested, and active.\n" ++
                     "  commit:  {s}\n  path:    {s}\n" ++
                     "`.cto/current` now points at it; `fx cto rollback` reverts.\n",
-                .{ id, release.version, release.commit, release.path },
+                .{ label, release.version, release.commit, release.path },
             );
             return 0;
         },
         .health_failed => |reason| {
             std.debug.print(
-                "Task #{d} is approved, but the release did not activate: {s}\n" ++
+                "{s} is approved, but the release did not activate: {s}\n" ++
                     "The capability is still a candidate because it is not live.\n" ++
-                    "Fix the candidate and retry with `fx cto activate {d}`.\n",
-                .{ id, reason, id },
+                    "Fix the candidate and retry with `fx cto activate {s}`.\n",
+                .{ label, reason, label },
             );
             return 1;
         },
@@ -539,11 +548,13 @@ fn runChannel(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []cons
             // be driven by transports authenticated only by something as
             // weak as a chat ID. The refusal lives here, at the boundary,
             // rather than in a future bot that would have to remember it.
+            var id_buf: [32]u8 = undefined;
+            const label = id_mod.formatBuf(&id_buf, .task, id);
             std.debug.print(
-                "task #{d} needs approval from the local CLI: `fx cto approve {d}`\n" ++
+                "{s} needs approval from the local CLI: `fx cto approve {s}`\n" ++
                     "Approving a candidate activates self-modifying code, which is not\n" ++
                     "delegated to a remote channel.\n",
-                .{ id, id },
+                .{ label, label },
             );
             return 1;
         },
@@ -561,8 +572,16 @@ fn runInterrupt(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []co
         std.debug.print("usage: fx cto interrupt <run-id>\n", .{});
         return 1;
     }
-    const run_id = std.fmt.parseInt(u64, args[1], 10) catch {
-        std.debug.print("fx cto interrupt: `{s}` is not a valid run id\n", .{args[1]});
+    // Strict, unlike `approve`/`activate`/`review`: a task id and a run id
+    // are both small integers starting at 1, so a bare integer here is
+    // genuinely ambiguous rather than merely inconvenient (D7).
+    const run_id = id_mod.parseStrict(.run, args[1]) orelse {
+        std.debug.print(
+            "fx cto interrupt: `{s}` is not a valid run id — use the `run-<id>` form (e.g. `run-12`), " ++
+                "not a bare number: a task id and a run id are both small integers, and this command only " ++
+                "ever means a run.\n",
+            .{args[1]},
+        );
         return 1;
     };
     return interruptRun(alloc, kernel, run_id);
@@ -579,28 +598,30 @@ fn runInterrupt(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, args: []co
 /// invocation that started it and cannot be reached from a second process
 /// at all. That is reported honestly rather than claimed as done.
 fn interruptRun(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, run_id: u64) !u8 {
+    var id_buf: [32]u8 = undefined;
+    const label = id_mod.formatBuf(&id_buf, .run, run_id);
     const pid = process_worker.readPid(alloc, kernel.cto_root, run_id) catch |err| {
-        std.debug.print("fx cto interrupt: could not check run #{d}: {s}\n", .{ run_id, @errorName(err) });
+        std.debug.print("fx cto interrupt: could not check {s}: {s}\n", .{ label, @errorName(err) });
         return 1;
     };
     if (pid == null) {
         try kernel.recordInterruptRequest(run_id, "no out-of-process worker found for this run");
         std.debug.print(
-            "no running out-of-process worker was found for run #{d}.\n" ++
+            "no running out-of-process worker was found for {s}.\n" ++
                 "It may have already finished, or it was dispatched in-process (the CLI default),\n" ++
                 "which cannot be cancelled from a separate command.\n",
-            .{run_id},
+            .{label},
         );
         return 1;
     }
     const marker_path = try process_worker.interruptMarkerPath(alloc, kernel.cto_root, run_id);
     defer alloc.free(marker_path);
     io_mod.writeFileAtomic(alloc, marker_path, "") catch |err| {
-        std.debug.print("fx cto interrupt: could not signal run #{d}: {s}\n", .{ run_id, @errorName(err) });
+        std.debug.print("fx cto interrupt: could not signal {s}: {s}\n", .{ label, @errorName(err) });
         return 1;
     };
     try kernel.recordInterruptRequest(run_id, "signaled");
-    std.debug.print("requested cancellation of run #{d} (pid {d}); it will stop shortly.\n", .{ run_id, pid.? });
+    std.debug.print("requested cancellation of {s} (pid {d}); it will stop shortly.\n", .{ label, pid.? });
     return 0;
 }
 

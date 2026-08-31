@@ -6,6 +6,7 @@
 //! class of problem docs/CTO_ROADMAP.md's D8/D9 exist to close).
 
 const std = @import("std");
+const id_mod = @import("id.zig");
 const kernel_mod = @import("kernel.zig");
 const release_mod = @import("release.zig");
 
@@ -43,8 +44,12 @@ pub fn renderTasks(writer: *std.Io.Writer, kernel: *kernel_mod.Kernel) !void {
         try writer.print("no tasks yet\n", .{});
         return;
     }
+    var id_buf: [32]u8 = undefined;
     for (kernel.tasks.items) |task| {
-        try writer.print("#{d} [{s}] {s} -> {s}\n", .{ task.id, @tagName(task.status), task.required_capability, task.assignee });
+        try writer.print(
+            "{s} [{s}] {s} -> {s}\n",
+            .{ id_mod.formatBuf(&id_buf, .task, task.id), @tagName(task.status), task.required_capability, task.assignee },
+        );
     }
 }
 
@@ -53,8 +58,9 @@ pub fn renderGoals(writer: *std.Io.Writer, kernel: *kernel_mod.Kernel) !void {
         try writer.print("no goals yet\n", .{});
         return;
     }
+    var id_buf: [32]u8 = undefined;
     for (kernel.goals.items) |goal| {
-        try writer.print("#{d} [{s}] {s}\n", .{ goal.id, @tagName(goal.status), goal.objective });
+        try writer.print("{s} [{s}] {s}\n", .{ id_mod.formatBuf(&id_buf, .goal, goal.id), @tagName(goal.status), goal.objective });
     }
 }
 
@@ -63,16 +69,20 @@ pub fn renderRuns(writer: *std.Io.Writer, kernel: *kernel_mod.Kernel) !void {
         try writer.print("no runs yet\n", .{});
         return;
     }
+    var run_id_buf: [32]u8 = undefined;
+    var task_id_buf: [32]u8 = undefined;
     for (kernel.runs.items) |worker_run| {
+        const run_id = id_mod.formatBuf(&run_id_buf, .run, worker_run.id);
+        const task_id = id_mod.formatBuf(&task_id_buf, .task, worker_run.task_id);
         if (worker_run.finished_reason) |reason| {
             try writer.print(
-                "#{d} task #{d} [{s}] {s} ({s})\n",
-                .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker, reason },
+                "{s} {s} [{s}] {s} ({s})\n",
+                .{ run_id, task_id, @tagName(worker_run.status), worker_run.worker, reason },
             );
         } else {
             try writer.print(
-                "#{d} task #{d} [{s}] {s}\n",
-                .{ worker_run.id, worker_run.task_id, @tagName(worker_run.status), worker_run.worker },
+                "{s} {s} [{s}] {s}\n",
+                .{ run_id, task_id, @tagName(worker_run.status), worker_run.worker },
             );
         }
     }
@@ -87,12 +97,13 @@ pub fn renderReleases(writer: *std.Io.Writer, alloc: std.mem.Allocator, kernel: 
     const current = try release_mod.readCurrent(alloc, kernel.cto_root);
     defer if (current) |value| alloc.free(value);
 
+    var task_id_buf: [32]u8 = undefined;
     for (kernel.releases.items) |release| {
         const active = if (current) |value| std.mem.eql(u8, value, release.path) else false;
-        try writer.print("v{d}{s} task #{d} {s} {s}\n", .{
+        try writer.print("v{d}{s} {s} {s} {s}\n", .{
             release.version,
             if (active) " (active)" else "",
-            release.task_id,
+            id_mod.formatBuf(&task_id_buf, .task, release.task_id),
             release.capability,
             release.commit,
         });
@@ -173,7 +184,7 @@ test "renderTasks reports the empty case and the same shape for a real task" {
     accumulating.writer.end = 0;
     try renderTasks(&accumulating.writer, &kernel);
     try std.testing.expectEqualStrings(
-        "#1 [created] github.pull_request.merged -> cto-dev\n",
+        "task-1 [created] github.pull_request.merged -> cto-dev\n",
         accumulating.writer.buffered(),
     );
 }

@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const io_mod = @import("../core/shared/io.zig");
 const control_protocol = @import("control_protocol.zig");
 const git = @import("git.zig");
+const id_mod = @import("id.zig");
 const kernel_mod = @import("kernel.zig");
 const process_worker_mod = @import("process_worker.zig");
 const runtime_mod = @import("runtime.zig");
@@ -159,12 +160,13 @@ fn executeRequest(
         .text = "request accepted; no missing capability was detected\n",
     };
     const task = kernel.findTask(id) orelse return error.TaskNotFound;
+    var id_buf: [32]u8 = undefined;
     return .{
         .exit_code = if (task.status == .failed) 1 else 0,
         .text = try std.fmt.allocPrint(
             alloc,
-            "task #{d} [{s}] {s}\n",
-            .{ id, @tagName(task.status), task.required_capability },
+            "{s} [{s}] {s}\n",
+            .{ id_mod.formatBuf(&id_buf, .task, id), @tagName(task.status), task.required_capability },
         ),
     };
 }
@@ -179,13 +181,16 @@ fn executeActivation(
     verb: ActivationVerb,
 ) !Outcome {
     const id_text = argument orelse return .{ .exit_code = 2, .text = "a task id argument is required\n" };
-    const id = std.fmt.parseInt(u64, id_text, 10) catch return .{ .exit_code = 2, .text = "invalid task id\n" };
+    const id = id_mod.parse(.task, id_text) orelse return .{ .exit_code = 2, .text = "invalid task id\n" };
     const outcome = switch (verb) {
         .approve => kernel.approve(repository_path, id),
         .activate => kernel.activate(repository_path, id),
-    } catch |err| return .{
-        .exit_code = 1,
-        .text = try std.fmt.allocPrint(alloc, "could not activate task #{d}: {s}\n", .{ id, @errorName(err) }),
+    } catch |err| {
+        var id_buf: [32]u8 = undefined;
+        return .{
+            .exit_code = 1,
+            .text = try std.fmt.allocPrint(alloc, "could not activate {s}: {s}\n", .{ id_mod.formatBuf(&id_buf, .task, id), @errorName(err) }),
+        };
     };
     return switch (outcome) {
         .activated => |release| .{
@@ -216,7 +221,12 @@ fn executeRollback(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel) !Outcom
 
 fn executeInterrupt(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, argument: ?[]const u8) !Outcome {
     const id_text = argument orelse return .{ .exit_code = 2, .text = "interrupt requires a run id\n" };
-    const run_id = std.fmt.parseInt(u64, id_text, 10) catch return .{ .exit_code = 2, .text = "invalid run id\n" };
+    // Strict, per D7: a task id and a run id are both small integers, so a
+    // bare integer is refused rather than silently treated as a run id.
+    const run_id = id_mod.parseStrict(.run, id_text) orelse return .{
+        .exit_code = 2,
+        .text = "invalid run id — use the `run-<id>` form (e.g. `run-12`), not a bare number\n",
+    };
     const pid = try process_worker_mod.readPid(alloc, kernel.cto_root, run_id);
     if (pid == null) {
         try kernel.recordInterruptRequest(run_id, "no out-of-process worker found for this run");
@@ -225,12 +235,16 @@ fn executeInterrupt(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, argume
     const marker = try process_worker_mod.interruptMarkerPath(alloc, kernel.cto_root, run_id);
     try io_mod.writeFileAtomic(alloc, marker, "");
     try kernel.recordInterruptRequest(run_id, "signaled via control socket");
-    return .{ .exit_code = 0, .text = try std.fmt.allocPrint(alloc, "interrupt requested for run #{d}\n", .{run_id}) };
+    var id_buf: [32]u8 = undefined;
+    return .{
+        .exit_code = 0,
+        .text = try std.fmt.allocPrint(alloc, "interrupt requested for {s}\n", .{id_mod.formatBuf(&id_buf, .run, run_id)}),
+    };
 }
 
 fn executeReview(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, argument: ?[]const u8) !Outcome {
     const id_text = argument orelse return .{ .exit_code = 2, .text = "review requires a task id\n" };
-    const id = std.fmt.parseInt(u64, id_text, 10) catch return .{ .exit_code = 2, .text = "invalid task id\n" };
+    const id = id_mod.parse(.task, id_text) orelse return .{ .exit_code = 2, .text = "invalid task id\n" };
     const task = kernel.findTask(id) orelse return .{ .exit_code = 1, .text = "task not found\n" };
     const worktree_path = task.worktree_path orelse return .{ .exit_code = 1, .text = "task has no candidate worktree\n" };
     const diff = try git.extensionDiff(alloc, worktree_path);
