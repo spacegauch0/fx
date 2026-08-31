@@ -132,7 +132,11 @@ fn runInner(
         return runIngest(alloc, &kernel, args);
     }
     if (std.mem.eql(u8, command, "events")) {
-        try printEvents(&kernel);
+        const since = parseSinceFlag(args[1..]) catch {
+            std.debug.print("usage: fx cto events [--since <sequence>]\n", .{});
+            return 1;
+        };
+        try printEvents(&kernel, since);
         return 0;
     }
     if (std.mem.eql(u8, command, "request")) {
@@ -732,7 +736,7 @@ fn printHelp() void {
         \\  rollback                  Point the active release at the previous version
         \\  interrupt <run-id>        Cancel an out-of-process worker run
         \\  logs <run-id> [--tail N]  Show a worker run's captured stdout/stderr
-        \\  events                    Show the append-only audit journal
+        \\  events [--since N]        Show the append-only audit journal (optionally only what's new)
         \\  daemon [--once]           Run the local control-plane daemon (foreground)
         \\  ctl '<json>'              Send one versioned control-protocol request
         \\
@@ -774,8 +778,19 @@ fn printDecisions(kernel: *kernel_mod.Kernel) !void {
     try withStderr(views.renderDecisions, .{kernel});
 }
 
-fn printEvents(kernel: *kernel_mod.Kernel) !void {
-    try withStderr(views.renderEvents, .{kernel});
+fn printEvents(kernel: *kernel_mod.Kernel, since: u64) !void {
+    try withStderr(views.renderEvents, .{ kernel, since });
+}
+
+/// Parses an optional `--since <sequence>` flag; `rest` is the command's
+/// arguments after the command name itself. No flag means "everything"
+/// (sequence 0, since real sequences start at 1).
+fn parseSinceFlag(rest: []const [:0]const u8) !u64 {
+    if (rest.len == 0) return 0;
+    if (rest.len == 2 and std.mem.eql(u8, rest[0], "--since")) {
+        return std.fmt.parseInt(u64, rest[1], 10) catch error.InvalidSinceValue;
+    }
+    return error.InvalidSinceFlag;
 }
 
 fn withStderr(comptime renderFn: anytype, args: anytype) !void {

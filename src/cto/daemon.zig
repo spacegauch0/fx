@@ -138,6 +138,7 @@ fn execute(alloc: std.mem.Allocator, config: Config, request: control_protocol.R
         .rollback => return executeRollback(alloc, &kernel),
         .interrupt => return executeInterrupt(alloc, &kernel, request.argument),
         .review => return executeReview(alloc, &kernel, request.argument),
+        .events => return executeEvents(alloc, &kernel, request.argument),
         else => return executeReadView(alloc, &kernel, request.command),
     }
 }
@@ -262,10 +263,23 @@ fn executeReadView(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, command
         .runs => try views.renderRuns(&accumulating.writer, kernel),
         .decisions => try views.renderDecisions(&accumulating.writer, kernel),
         .observations => try views.renderObservations(&accumulating.writer, kernel),
-        .events => try views.renderEvents(&accumulating.writer, kernel),
         .releases => try views.renderReleases(&accumulating.writer, alloc, kernel),
         else => unreachable, // every remaining Command variant is handled in execute() before reaching here
     }
+    return .{ .exit_code = 0, .text = try alloc.dupe(u8, accumulating.writer.buffered()) };
+}
+
+/// `argument`, when present, is the `--since` sequence as a plain decimal
+/// string (the control protocol carries one optional string argument per
+/// request; this is that argument's meaning for `events` specifically).
+fn executeEvents(alloc: std.mem.Allocator, kernel: *kernel_mod.Kernel, argument: ?[]const u8) !Outcome {
+    const since: u64 = if (argument) |text|
+        std.fmt.parseInt(u64, text, 10) catch return .{ .exit_code = 2, .text = "invalid --since sequence\n" }
+    else
+        0;
+    var accumulating = std.Io.Writer.Allocating.init(alloc);
+    defer accumulating.deinit();
+    try views.renderEvents(&accumulating.writer, kernel, since);
     return .{ .exit_code = 0, .text = try alloc.dupe(u8, accumulating.writer.buffered()) };
 }
 

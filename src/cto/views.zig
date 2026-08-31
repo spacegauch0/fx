@@ -149,16 +149,26 @@ pub fn renderDecisions(writer: *std.Io.Writer, kernel: *kernel_mod.Kernel) !void
     if (!found) try writer.print("no policy decisions yet\n", .{});
 }
 
-pub fn renderEvents(writer: *std.Io.Writer, kernel: *kernel_mod.Kernel) !void {
-    if (kernel.journal.events.items.len == 0) {
-        try writer.print("no events yet\n", .{});
-        return;
-    }
+/// `since` filters to events with `sequence > since`; pass 0 for the full
+/// history (sequences start at 1, so 0 excludes nothing). Lets an agent
+/// check "what happened since I last looked" in O(new), not by rereading
+/// the whole append-only journal on every check-in (D7).
+pub fn renderEvents(writer: *std.Io.Writer, kernel: *kernel_mod.Kernel, since: u64) !void {
+    var found = false;
     for (kernel.journal.events.items) |event| {
+        if (event.sequence <= since) continue;
+        found = true;
         try writer.print(
             "{d} {s} {s}: {s}\n",
             .{ event.sequence, @tagName(event.kind), event.subject, event.detail },
         );
+    }
+    if (!found) {
+        if (since == 0) {
+            try writer.print("no events yet\n", .{});
+        } else {
+            try writer.print("no events since {d}\n", .{since});
+        }
     }
 }
 
@@ -185,6 +195,45 @@ test "renderTasks reports the empty case and the same shape for a real task" {
     try renderTasks(&accumulating.writer, &kernel);
     try std.testing.expectEqualStrings(
         "task-1 [created] github.pull_request.merged -> cto-dev\n",
+        accumulating.writer.buffered(),
+    );
+}
+
+test "renderEvents --since filters to what's new without rereading the whole journal" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const io_mod = @import("../core/shared/io.zig");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try io_mod.dirRealpathAlloc(alloc, tmp.dir, ".");
+    const cto_root = try std.fs.path.join(alloc, &.{ root, ".cto" });
+
+    var kernel = try kernel_mod.Kernel.init(alloc, cto_root);
+    _ = try kernel.createCapabilityTask("watch merged pull requests", "github.pull_request.merged");
+    _ = try kernel.createCapabilityTask("watch merged pull requests again", "github.pull_request.merged2");
+    // Two tasks, two events each (task_created plus whatever the create
+    // path also journals) — enough sequence numbers to filter on.
+    const total = kernel.journal.events.items.len;
+    try std.testing.expect(total >= 2);
+
+    var accumulating = std.Io.Writer.Allocating.init(alloc);
+    defer accumulating.deinit();
+
+    try renderEvents(&accumulating.writer, &kernel, 0);
+    const full = accumulating.writer.buffered();
+    try std.testing.expect(std.mem.count(u8, full, "\n") == total);
+
+    accumulating.writer.end = 0;
+    try renderEvents(&accumulating.writer, &kernel, @intCast(total - 1));
+    const tail = accumulating.writer.buffered();
+    try std.testing.expect(std.mem.count(u8, tail, "\n") == 1);
+
+    accumulating.writer.end = 0;
+    try renderEvents(&accumulating.writer, &kernel, @intCast(total));
+    try std.testing.expectEqualStrings(
+        try std.fmt.allocPrint(alloc, "no events since {d}\n", .{total}),
         accumulating.writer.buffered(),
     );
 }
