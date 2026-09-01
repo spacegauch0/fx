@@ -382,7 +382,7 @@ fn writeUpgradeRelaunchFailure(
     writeStderr(deps, message);
 }
 
-fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
+pub fn cliSurfaceConfig(cfg: Config) cli_surface.Config {
     return .{
         .version = cfg.version,
         .revision = cfg.revision,

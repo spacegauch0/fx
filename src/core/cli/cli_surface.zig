@@ -3430,7 +3430,7 @@ test "session recovery boundary failures keep stable text and json guidance" {
     );
 }
 
-fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
+pub fn workflowConfig(cfg: Config) @import("cli_ask.zig").Config {
     return .{
         .command_usage = command_specs.topLevelUsage(cfg.command_catalog, .ask),
         .default_model = cfg.default_model,
